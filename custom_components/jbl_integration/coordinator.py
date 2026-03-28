@@ -1,12 +1,15 @@
 """Sensor platform for JBL integration."""
 import asyncio
 import aiohttp
+from aiohttp import web
 import json
 import logging
 import urllib3
 import ssl
 import certifi
+import socket
 from datetime import timedelta
+from xml.etree import ElementTree as ET
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_UUID, CONF_ADDRESS, CONF_SCAN_INTERVAL
 from homeassistant.exceptions import ConfigEntryNotReady
@@ -39,8 +42,171 @@ class Coordinator(DataUpdateCoordinator):
                 update_interval=timedelta(seconds=int(scan_interval)),
             )
 
+    # UPnP tag -> coordinator data key mapping
+    _UPNP_TAG_MAP = {
+        "TransportState": "transport_state",
+        "CurrentTrackDuration": "track_duration",
+        "CurrentMediaDuration": "track_duration",
+    }
+
+    async def _setup_upnp_listener(self):
+        """Set up a small HTTP server to receive UPnP event callbacks."""
+        self._upnp_runner = None
+        self._upnp_sid = None
+        self._upnp_renew_task = None
+        self._upnp_port = None
+
+        try:
+            local_ip = await self.hass.async_add_executor_job(self._get_local_ip)
+
+            app = web.Application()
+            app.router.add_route("NOTIFY", "/upnp/callback", self._handle_upnp_event)
+            self._upnp_runner = web.AppRunner(app)
+            await self._upnp_runner.setup()
+            # Use port 0 to let OS assign a free port (supports multi-device)
+            site = web.TCPSite(self._upnp_runner, "0.0.0.0", 0)
+            await site.start()
+            # Retrieve the actual assigned port
+            sockets = site._server.sockets
+            self._upnp_port = sockets[0].getsockname()[1] if sockets else 0
+            self._callback_url = f"http://{local_ip}:{self._upnp_port}/upnp/callback"
+            _LOGGER.debug("UPnP event listener started on port %s", self._upnp_port)
+
+            await self._subscribe_upnp_events()
+        except Exception as e:
+            _LOGGER.warning("Failed to start UPnP event listener: %s", str(e))
+            await self._stop_upnp_listener()
+
+    def _get_local_ip(self):
+        """Get the local IP address that can reach the soundbar."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((self.address, 59152))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+
+    async def _subscribe_upnp_events(self):
+        """Subscribe to AVTransport UPnP events."""
+        url = f"http://{self.address}:59152/upnp/event/rendertransport1"
+        headers = {
+            "CALLBACK": f"<{self._callback_url}>",
+            "NT": "upnp:event",
+            "TIMEOUT": "Second-300",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with asyncio.timeout(5):
+                    async with session.request("SUBSCRIBE", url, headers=headers) as resp:
+                        if resp.status == 200:
+                            self._upnp_sid = resp.headers.get("SID")
+                            _LOGGER.debug("UPnP subscribed, SID: %s", self._upnp_sid)
+                            if self._upnp_renew_task:
+                                self._upnp_renew_task.cancel()
+                            self._upnp_renew_task = asyncio.create_task(self._renew_upnp_subscription())
+                        else:
+                            _LOGGER.warning("UPnP subscribe failed: %s", resp.status)
+        except Exception as e:
+            _LOGGER.warning("UPnP subscribe error: %s", str(e))
+
+    async def _renew_upnp_subscription(self):
+        """Renew the UPnP subscription every 4 minutes."""
+        try:
+            while True:
+                await asyncio.sleep(240)
+                if not self._upnp_sid:
+                    await self._subscribe_upnp_events()
+                    return
+                url = f"http://{self.address}:59152/upnp/event/rendertransport1"
+                headers = {
+                    "SID": self._upnp_sid,
+                    "TIMEOUT": "Second-300",
+                }
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with asyncio.timeout(5):
+                            async with session.request("SUBSCRIBE", url, headers=headers) as resp:
+                                if resp.status == 200:
+                                    _LOGGER.debug("UPnP subscription renewed")
+                                else:
+                                    _LOGGER.warning("UPnP renew failed: %s, resubscribing", resp.status)
+                                    self._upnp_sid = None
+                                    await self._subscribe_upnp_events()
+                                    return
+                except Exception as e:
+                    _LOGGER.warning("UPnP renew error: %s, resubscribing", str(e))
+                    self._upnp_sid = None
+                    await self._subscribe_upnp_events()
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _handle_upnp_event(self, request):
+        """Handle incoming UPnP NOTIFY events."""
+        # Validate SID matches our subscription
+        event_sid = request.headers.get("SID", "")
+        if self._upnp_sid and event_sid != self._upnp_sid:
+            return web.Response(status=412, text="SID mismatch")
+
+        try:
+            body = await request.text()
+            _LOGGER.debug("UPnP event received: %s", body[:500])
+
+            root = ET.fromstring(body)
+            ns = {"e": "urn:schemas-upnp-org:event-1-0"}
+            last_change = root.find(".//e:property/LastChange", ns)
+            if last_change is not None and last_change.text:
+                inner = ET.fromstring(last_change.text)
+                instance = inner.find(".//{urn:schemas-upnp-org:metadata-1-0/AVT/}InstanceID")
+                if instance is not None:
+                    updated = False
+                    for child in instance:
+                        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                        data_key = self._UPNP_TAG_MAP.get(tag)
+                        if data_key is None:
+                            continue
+                        val = child.get("val", "")
+                        if val != self.data.get(data_key):
+                            self.data[data_key] = val
+                            updated = True
+                            _LOGGER.debug("UPnP instant update: %s = %s", data_key, val)
+
+                    if updated:
+                        self.async_set_updated_data(dict(self.data))
+
+        except Exception as e:
+            _LOGGER.warning("Error handling UPnP event: %s", str(e))
+
+        return web.Response(text="OK")
+
+    async def _stop_upnp_listener(self):
+        """Stop the UPnP event listener and unsubscribe."""
+        if self._upnp_renew_task:
+            self._upnp_renew_task.cancel()
+            try:
+                await self._upnp_renew_task
+            except asyncio.CancelledError:
+                pass
+            self._upnp_renew_task = None
+
+        if self._upnp_sid:
+            try:
+                url = f"http://{self.address}:59152/upnp/event/rendertransport1"
+                headers = {"SID": self._upnp_sid}
+                async with aiohttp.ClientSession() as session:
+                    async with asyncio.timeout(3):
+                        await session.request("UNSUBSCRIBE", url, headers=headers)
+            except Exception:
+                pass
+            self._upnp_sid = None
+
+        if self._upnp_runner:
+            await self._upnp_runner.cleanup()
+            self._upnp_runner = None
+            _LOGGER.debug("UPnP event listener stopped")
+
     async def _SetupDeviceInfo(self):
-        #Setting up cert        
+        #Setting up cert
         cert_path = self.hass.config.path("custom_components/jbl_integration/Cert.pem")
         key_path = self.hass.config.path("custom_components/jbl_integration/Key.pem")
         self.sslcontext.load_cert_chain(certfile=cert_path, keyfile=key_path)
