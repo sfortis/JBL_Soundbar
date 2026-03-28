@@ -42,6 +42,8 @@ class Coordinator(DataUpdateCoordinator):
         ssl_context.verify_mode = ssl.CERT_NONE
         self.sslcontext = ssl_context
 
+        self._upnp_poll_count = 0
+
         if hass is not None and entry is not None:
             self._entry = entry
             self.hass = hass
@@ -111,7 +113,6 @@ class Coordinator(DataUpdateCoordinator):
         """Set up a small HTTP server to receive UPnP event callbacks."""
         self._upnp_runner = None
         self._upnp_sid = None
-        self._upnp_renew_task = None
         self._upnp_port = None
 
         try:
@@ -156,46 +157,38 @@ class Coordinator(DataUpdateCoordinator):
                 async with session.request("SUBSCRIBE", url, headers=headers) as resp:
                     if resp.status == 200:
                         self._upnp_sid = resp.headers.get("SID")
+                        self._upnp_poll_count = 0
                         _LOGGER.debug("UPnP subscribed, SID: %s", self._upnp_sid)
-                        if self._upnp_renew_task:
-                            self._upnp_renew_task.cancel()
-                        self._upnp_renew_task = asyncio.create_task(self._renew_upnp_subscription())
                     else:
                         _LOGGER.warning("UPnP subscribe failed: %s", resp.status)
         except Exception as e:
             _LOGGER.warning("UPnP subscribe error: %s", str(e))
 
     async def _renew_upnp_subscription(self):
-        """Renew the UPnP subscription every 4 minutes."""
-        try:
-            while True:
-                await asyncio.sleep(240)
-                if not self._upnp_sid:
-                    await self._subscribe_upnp_events()
-                    return
-                url = f"http://{self.address}:59152/upnp/event/rendertransport1"
-                headers = {
-                    "SID": self._upnp_sid,
-                    "TIMEOUT": "Second-300",
-                }
-                try:
-                    async with aiohttp.ClientSession() as session:
-                      async with asyncio.timeout(5):
-                        async with session.request("SUBSCRIBE", url, headers=headers) as resp:
-                            if resp.status == 200:
-                                _LOGGER.debug("UPnP subscription renewed")
-                            else:
-                                _LOGGER.warning("UPnP renew failed: %s, resubscribing", resp.status)
-                                self._upnp_sid = None
-                                await self._subscribe_upnp_events()
-                                return
-                except Exception as e:
-                    _LOGGER.warning("UPnP renew error: %s, resubscribing", str(e))
-                    self._upnp_sid = None
-                    await self._subscribe_upnp_events()
-                    return
-        except asyncio.CancelledError:
+        """Renew the UPnP subscription using the existing SID."""
+        if not self._upnp_sid:
+            await self._subscribe_upnp_events()
             return
+        url = f"http://{self.address}:59152/upnp/event/rendertransport1"
+        headers = {
+            "SID": self._upnp_sid,
+            "TIMEOUT": "Second-300",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with asyncio.timeout(5):
+                    async with session.request("SUBSCRIBE", url, headers=headers) as resp:
+                        if resp.status == 200:
+                            self._upnp_poll_count = 0
+                            _LOGGER.debug("UPnP subscription renewed")
+                        else:
+                            _LOGGER.warning("UPnP renew failed: %s, resubscribing", resp.status)
+                            self._upnp_sid = None
+                            await self._subscribe_upnp_events()
+        except Exception as e:
+            _LOGGER.warning("UPnP renew error: %s, resubscribing", str(e))
+            self._upnp_sid = None
+            await self._subscribe_upnp_events()
 
     async def _handle_upnp_event(self, request):
         """Handle incoming UPnP NOTIFY events."""
@@ -237,14 +230,6 @@ class Coordinator(DataUpdateCoordinator):
 
     async def _stop_upnp_listener(self):
         """Stop the UPnP event listener and unsubscribe."""
-        if self._upnp_renew_task:
-            self._upnp_renew_task.cancel()
-            try:
-                await self._upnp_renew_task
-            except asyncio.CancelledError:
-                pass
-            self._upnp_renew_task = None
-
         if self._upnp_sid:
             try:
                 url = f"http://{self.address}:59152/upnp/event/rendertransport1"
@@ -302,6 +287,37 @@ class Coordinator(DataUpdateCoordinator):
         except Exception:
             self._newFirmware = False
 
+        await self._detect_capabilities()
+
+    async def _detect_capabilities(self):
+        """Probe the device to determine which features are supported."""
+        # Map: capability name -> (API command, required response key)
+        # If the command returns "unknown command" or the key is missing, the feature is not supported
+        probes = {
+            "atmos": ("getAtmosLevel", "atmos_level"),
+            "rear_speakers": ("getRearSpeakerStatus", "rears"),
+            "smart_mode": ("getSmartMode", "status"),
+            "night_mode": ("getPersonalListeningMode", "status"),
+            "pure_voice": ("getPureVoiceState", "purevoice_state"),
+            "calibration": ("getCalibrationStatus", None),
+            "hdmi": ("getHdmiStatus", None),
+            "bass_boost": ("getBassBoostStatus", None),
+        }
+        self._capabilities = {}
+        for cap, (command, required_key) in probes.items():
+            response = await self._https_get(command)
+            if not response:
+                self._capabilities[cap] = False
+            elif required_key:
+                self._capabilities[cap] = required_key in response
+            else:
+                self._capabilities[cap] = True
+            _LOGGER.debug("Capability %s: %s", cap, self._capabilities[cap])
+
+    def has_capability(self, capability):
+        """Check if the device supports a specific capability."""
+        return self._capabilities.get(capability, False)
+
     @property
     def device_info(self):
         """Return device information about this entity."""
@@ -322,6 +338,11 @@ class Coordinator(DataUpdateCoordinator):
     # --- Polling ---
 
     async def _async_update_data(self):
+        # Renew UPnP subscription every ~40 polls (~200 sec with 5 sec interval)
+        self._upnp_poll_count += 1
+        if self._upnp_poll_count >= 40:
+            await self._renew_upnp_subscription()
+
         combined_data = {
             **await self.requestInfo(),
             **await self._getEQData(),
@@ -329,6 +350,8 @@ class Coordinator(DataUpdateCoordinator):
             **await self.getRearSpeaker(),
             **await self.getSmartMode(),
             **await self.getPureVoice(),
+            **await self.getSleepTimer(),
+            **await self.getNetworkInfo(),
         }
 
         if self.data is None:
@@ -577,3 +600,40 @@ class Coordinator(DataUpdateCoordinator):
     async def setPureVoice(self, value: bool):
         strvalue = "1" if value else "0"
         await self._https_post(f'command=setPureVoiceState&payload={{"purevoice_state":"{strvalue}"}}')
+
+    # --- Sleep Timer ---
+
+    async def getSleepTimer(self):
+        response = await self._https_get("getSleepTimer")
+        if "sleep_timer" in response:
+            return {
+                "sleep_timer": int(response.get("sleep_timer", 0)),
+                "sleep_remain": int(response.get("remain_time", 0)),
+            }
+        return {}
+
+    async def setSleepTimer(self, minutes: int):
+        await self._https_post(f'command=setSleepTimer&payload={{"sleep_timer":"{minutes}"}}')
+
+    # --- Network / Group info ---
+
+    async def getNetworkInfo(self):
+        response = await self._https_get("getStatusEx")
+        if not response:
+            return {}
+        result = {}
+        if "RSSI" in response:
+            result["wifi_rssi"] = int(response["RSSI"])
+        if "internet" in response:
+            result["internet"] = response["internet"] == "1" or response["internet"] == 1
+        if "essid" in response:
+            try:
+                result["wifi_ssid"] = bytes.fromhex(response["essid"]).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                result["wifi_ssid"] = response["essid"]
+        if "WifiChannel" in response:
+            result["wifi_channel"] = int(response.get("WifiChannel", 0))
+        # Group mode from getStatusEx or getGroupInfo
+        if "hm_dev_mode" in response:
+            result["group_mode"] = response["hm_dev_mode"]
+        return result

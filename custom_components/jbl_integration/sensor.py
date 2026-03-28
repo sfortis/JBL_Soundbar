@@ -7,7 +7,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.const import PERCENTAGE
+from homeassistant.const import PERCENTAGE, SIGNAL_STRENGTH_DECIBELS_MILLIWATT
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -35,10 +35,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entityArray.append(JBLSensor(coordinator,entry,"track","Track","mdi:information"))
     entityArray.append(JBLSensor(coordinator,entry,"channel","Channel","mdi:information"))
     
-    if "Rears" in coordinator.data:
-        entityArray.append(JBLRearSensor(coordinator,entry,0))
-        entityArray.append(JBLRearSensor(coordinator,entry,1))
-        
+    # Network / status sensors
+    entityArray.append(JBLWiFiSignalSensor(coordinator, entry))
+    entityArray.append(JBLSensor(coordinator,entry,"wifi_ssid","WiFi SSID","mdi:wifi-settings"))
+    entityArray.append(JBLSensor(coordinator,entry,"group_mode","Group Mode","mdi:speaker-multiple"))
+    entityArray.append(JBLSensor(coordinator,entry,"sleep_remain","Sleep Timer Remaining","mdi:timer-sand"))
+
+    if coordinator.has_capability("rear_speakers"):
+        for i in range(len(coordinator.data.get("Rears", []))):
+            entityArray.append(JBLRearSensor(coordinator, entry, i))
+
     async_add_entities(entityArray)
 
     
@@ -169,4 +175,55 @@ class JBLRearSensor(Entity):
 
     async def async_update(self):
         """Update the sensor."""
+        await self.coordinator.async_request_refresh()
+
+
+class JBLWiFiSignalSensor(SensorEntity):
+    """WiFi signal strength sensor with proper device class for graphs."""
+
+    def __init__(self, coordinator, entry):
+        self.coordinator = coordinator
+        self._entry = entry
+        self.entity_id = f"sensor.{self.coordinator.device_info.get('name', 'jbl_integration').replace(' ', '_').lower()}_wifi_signal"
+
+    @property
+    def name(self):
+        return "WiFi Signal"
+
+    @property
+    def unique_id(self):
+        return f"jbl_wifi_signal_{self._entry.entry_id}"
+
+    @property
+    def device_class(self):
+        return SensorDeviceClass.SIGNAL_STRENGTH
+
+    @property
+    def state_class(self):
+        return SensorStateClass.MEASUREMENT
+
+    @property
+    def native_unit_of_measurement(self):
+        return SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+
+    @property
+    def native_value(self):
+        return self.coordinator.data.get("wifi_rssi")
+
+    @property
+    def icon(self):
+        return "mdi:wifi"
+
+    @property
+    def device_info(self):
+        return self.coordinator.device_info
+
+    @property
+    def should_poll(self):
+        return False
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
+
+    async def async_update(self):
         await self.coordinator.async_request_refresh()

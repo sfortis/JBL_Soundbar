@@ -17,12 +17,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     entityArray = []
     entityArray.append(JBLPowerSwitch(entry, coordinator))
-    if "SmartMode" in coordinator.data:
+    if coordinator.has_capability("smart_mode"):
         entityArray.append(SmartModeSwitch(entry, coordinator))
-    if "NightMode" in coordinator.data:
+    if coordinator.has_capability("night_mode"):
         entityArray.append(NightModeSwitch(entry, coordinator))
-    if "PureVoice" in coordinator.data:
-        entityArray.append(PureVoiceModeSwitch(entry, coordinator))    
+    if coordinator.has_capability("pure_voice"):
+        entityArray.append(PureVoiceModeSwitch(entry, coordinator))
     async_add_entities(entityArray)
 
 

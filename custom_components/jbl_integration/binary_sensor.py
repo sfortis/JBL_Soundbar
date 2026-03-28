@@ -12,15 +12,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     """Set up the JBL binary sensor platform."""
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
 
-    if "Rears" in coordinator.data:
-        async_add_entities([
-            JBLChargingSensor(coordinator, entry, 0),
-            JBLDockedSensor(coordinator, entry, 0),
-            JBLOnlineSensor(coordinator, entry, 0),
-            JBLChargingSensor(coordinator, entry, 1),
-            JBLDockedSensor(coordinator, entry, 1),
-            JBLOnlineSensor(coordinator, entry, 1),
-        ])
+    if coordinator.has_capability("rear_speakers"):
+        entities = []
+        for i in range(len(coordinator.data.get("Rears", []))):
+            entities.append(JBLChargingSensor(coordinator, entry, i))
+            entities.append(JBLDockedSensor(coordinator, entry, i))
+            entities.append(JBLOnlineSensor(coordinator, entry, i))
+        async_add_entities(entities)
 
 class JBLChargingSensor(BinarySensorEntity):
     """Representation of a charging sensor for the JBL rear speakers."""

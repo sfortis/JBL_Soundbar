@@ -30,7 +30,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entityArray.append(JBLEqNumber(entry, coordinator,"EQ_1_Low"))
         entityArray.append(JBLEqNumber(entry, coordinator,"EQ_2_Mid"))
         entityArray.append(JBLEqNumber(entry, coordinator,"EQ_3_High"))
-    
+
+    entityArray.append(JBLSleepTimerNumber(entry, coordinator))
+
     async_add_entities(entityArray)
 
 
@@ -105,6 +107,67 @@ class JBLVolumeNumber(NumberEntity):
         """Update the sensor."""
         await self.coordinator.async_request_refresh()
 
+
+class JBLSleepTimerNumber(NumberEntity):
+    """Number entity to set the sleep timer in minutes."""
+
+    def __init__(self, entry: ConfigEntry, coordinator: Coordinator):
+        self._entry = entry
+        self.coordinator = coordinator
+        self.entity_id = f"number.{self.coordinator.device_info.get('name', 'jbl_integration').replace(' ', '_').lower()}_sleep_timer"
+
+    @property
+    def name(self):
+        return "Sleep Timer"
+
+    @property
+    def unique_id(self):
+        return f"jbl_sleep_timer_{self._entry.entry_id}"
+
+    @property
+    def icon(self):
+        return "mdi:timer-outline"
+
+    @property
+    def device_info(self):
+        return self.coordinator.device_info
+
+    @property
+    def native_min_value(self):
+        return 0
+
+    @property
+    def native_max_value(self):
+        return 120
+
+    @property
+    def native_step(self):
+        return 1
+
+    @property
+    def native_value(self):
+        return self.coordinator.data.get("sleep_timer", 0)
+
+    @property
+    def native_unit_of_measurement(self):
+        return "min"
+
+    @property
+    def should_poll(self):
+        return False
+
+    async def async_set_native_value(self, value: float):
+        await self.coordinator.setSleepTimer(int(value))
+        self.coordinator.data["sleep_timer"] = int(value)
+        self.async_write_ha_state()
+        await asyncio.sleep(1)
+        await self.coordinator.async_request_refresh()
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
+
+    async def async_update(self):
+        await self.coordinator.async_request_refresh()
 class JBLEqNumber(NumberEntity):
     """Representation of a number to control the EQ."""
 
