@@ -94,8 +94,6 @@ class JBLVolumeNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float):
         await self.coordinator.setVolume(value)
-        self.coordinator.data["volume_level"] = str(round(value))
-        self.async_write_ha_state()
         await asyncio.sleep(1)
         await self.coordinator.async_request_refresh()
 
