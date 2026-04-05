@@ -66,6 +66,9 @@ class Coordinator(DataUpdateCoordinator):
                     async with session.get(url, headers=HTTPS_HEADERS, ssl=self.sslcontext) as response:
                         if response.status == 200:
                             response_text = await response.text()
+                            if response_text == "unknown command":
+                                _LOGGER.debug("%s: unsupported command", command)
+                                return {}
                             _LOGGER.debug("%s Response: %s", command, response_text)
                             return json.loads(response_text)
                         else:

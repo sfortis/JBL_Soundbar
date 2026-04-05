@@ -19,9 +19,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entityArray = []
     entityArray.append(JBLVolumeNumber(entry, coordinator))
     if coordinator.newFirmware:
-        entityArray.append(JBLEqNumber(entry, coordinator," 125Hz"))
-        entityArray.append(JBLEqNumber(entry, coordinator," 250Hz"))
-        entityArray.append(JBLEqNumber(entry, coordinator," 500Hz"))
+        entityArray.append(JBLEqNumber(entry, coordinator,"125Hz"))
+        entityArray.append(JBLEqNumber(entry, coordinator,"250Hz"))
+        entityArray.append(JBLEqNumber(entry, coordinator,"500Hz"))
         entityArray.append(JBLEqNumber(entry, coordinator,"1000Hz"))
         entityArray.append(JBLEqNumber(entry, coordinator,"2000Hz"))
         entityArray.append(JBLEqNumber(entry, coordinator,"4000Hz"))
@@ -203,7 +203,7 @@ class JBLEqNumber(NumberEntity):
     @property
     def native_min_value(self):
         """Return the minimum value."""
-        minValue = -6 if ("EQ_1_Low" != self.entityName and " 125Hz" != self.entityName) else -9
+        minValue = -6 if ("EQ_1_Low" != self.entityName and "125Hz" != self.entityName) else -9
         return minValue
 
     @property
