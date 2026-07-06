@@ -4,6 +4,7 @@ import aiohttp
 from aiohttp import web
 import json
 import logging
+import time
 import urllib3
 import ssl
 import certifi
@@ -11,7 +12,6 @@ import socket
 from datetime import timedelta
 from xml.etree import ElementTree as ET
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_UUID, CONF_ADDRESS, CONF_SCAN_INTERVAL
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.util import dt as dt_util
 from .const import DOMAIN
@@ -21,6 +21,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _LOGGER = logging.getLogger(__name__)
 
 HTTPS_HEADERS = {"Accept-Encoding": "gzip"}
+
+# UPnP event subscription lifetime we request from the device (seconds). The
+# device may grant a shorter window in its SUBSCRIBE response TIMEOUT header,
+# which is why we read it back rather than assuming this value holds.
+UPNP_SUBSCRIBE_TIMEOUT = 300
+# Replace the subscription with a fresh one at this fraction of the granted
+# timeout. We deliberately do NOT use SID-based SUBSCRIBE renewals: this
+# Linkplay firmware answers a renew with 200 but still drops the subscription
+# on its own internal timer (~460s observed), so renews never actually extend
+# it. A fresh SUBSCRIBE (new SID) is handled reliably, so we proactively
+# resubscribe well before the device would drop the current one.
+UPNP_RESUBSCRIBE_FRACTION = 0.85
+# Never resubscribe more aggressively than this, even if the device grants a
+# tiny window, to avoid a busy loop.
+UPNP_MIN_RESUBSCRIBE_AFTER = 30
 
 
 class Coordinator(DataUpdateCoordinator):
@@ -38,12 +53,18 @@ class Coordinator(DataUpdateCoordinator):
         self.address = address
         self.pollingRate = scan_interval
         self.data = {}
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        self.sslcontext = ssl_context
+        # Built lazily off the event loop (see _ensure_ssl_context): creating a
+        # default SSL context loads the certifi CA bundle from disk, which is
+        # blocking I/O and must not run in the event loop.
+        self.sslcontext = None
 
-        self._upnp_poll_count = 0
+        # UPnP subscription refresh is driven by wall-clock time (monotonic),
+        # not poll count: each poll runs several sequential HTTP/SOAP calls, so
+        # the real interval between polls is well above scan_interval and a
+        # count-based schedule would drift past the subscription's expiry.
+        self._upnp_sub_time = None
+        self._upnp_timeout = UPNP_SUBSCRIBE_TIMEOUT
+        self._upnp_resubscribe_after = UPNP_SUBSCRIBE_TIMEOUT * UPNP_RESUBSCRIBE_FRACTION
         # Per-track position tracking — kept on the coordinator instance because
         # DataUpdateCoordinator replaces self.data wholesale on every refresh.
         self._position_offset = None
@@ -153,13 +174,40 @@ class Coordinator(DataUpdateCoordinator):
         finally:
             s.close()
 
+    def _parse_timeout_seconds(self, header_value):
+        """Parse a UPnP TIMEOUT header ('Second-300' / 'Second-infinite')."""
+        if not header_value:
+            return UPNP_SUBSCRIBE_TIMEOUT
+        value = header_value.strip()
+        if value.lower().startswith("second-"):
+            value = value.split("-", 1)[1]
+        if value.lower() == "infinite":
+            return UPNP_SUBSCRIBE_TIMEOUT
+        try:
+            seconds = int(value)
+            return seconds if seconds > 0 else UPNP_SUBSCRIBE_TIMEOUT
+        except ValueError:
+            return UPNP_SUBSCRIBE_TIMEOUT
+
+    def _record_subscription(self, resp):
+        """Record the granted subscription lifetime and reset the refresh clock.
+
+        The device may grant a shorter TIMEOUT than we requested, so we schedule
+        the next resubscribe at a fraction of whatever it actually gave us.
+        """
+        self._upnp_timeout = self._parse_timeout_seconds(resp.headers.get("TIMEOUT"))
+        self._upnp_resubscribe_after = max(
+            UPNP_MIN_RESUBSCRIBE_AFTER, self._upnp_timeout * UPNP_RESUBSCRIBE_FRACTION
+        )
+        self._upnp_sub_time = time.monotonic()
+
     async def _subscribe_upnp_events(self):
         """Subscribe to AVTransport UPnP events."""
         url = f"http://{self.address}:59152/upnp/event/rendertransport1"
         headers = {
             "CALLBACK": f"<{self._callback_url}>",
             "NT": "upnp:event",
-            "TIMEOUT": "Second-300",
+            "TIMEOUT": f"Second-{UPNP_SUBSCRIBE_TIMEOUT}",
         }
         try:
             async with aiohttp.ClientSession() as session:
@@ -167,38 +215,42 @@ class Coordinator(DataUpdateCoordinator):
                 async with session.request("SUBSCRIBE", url, headers=headers) as resp:
                     if resp.status == 200:
                         self._upnp_sid = resp.headers.get("SID")
-                        self._upnp_poll_count = 0
-                        _LOGGER.debug("UPnP subscribed, SID: %s", self._upnp_sid)
+                        self._record_subscription(resp)
+                        _LOGGER.debug(
+                            "UPnP subscribed, SID: %s (timeout %ss, resubscribe in %ss)",
+                            self._upnp_sid, self._upnp_timeout, int(self._upnp_resubscribe_after),
+                        )
                     else:
-                        _LOGGER.warning("UPnP subscribe failed: %s", resp.status)
+                        _LOGGER.debug("UPnP subscribe failed: %s", resp.status)
         except Exception as e:
-            _LOGGER.warning("UPnP subscribe error: %s", str(e))
+            _LOGGER.debug("UPnP subscribe error: %s", str(e))
 
-    async def _renew_upnp_subscription(self):
-        """Renew the UPnP subscription using the existing SID."""
-        if not self._upnp_sid:
-            await self._subscribe_upnp_events()
+    async def _unsubscribe_upnp(self, sid):
+        """Send a best-effort UNSUBSCRIBE for the given SID."""
+        if not sid:
             return
         url = f"http://{self.address}:59152/upnp/event/rendertransport1"
-        headers = {
-            "SID": self._upnp_sid,
-            "TIMEOUT": "Second-300",
-        }
         try:
             async with aiohttp.ClientSession() as session:
-                async with asyncio.timeout(5):
-                    async with session.request("SUBSCRIBE", url, headers=headers) as resp:
-                        if resp.status == 200:
-                            self._upnp_poll_count = 0
-                            _LOGGER.debug("UPnP subscription renewed")
-                        else:
-                            _LOGGER.warning("UPnP renew failed: %s, resubscribing", resp.status)
-                            self._upnp_sid = None
-                            await self._subscribe_upnp_events()
+                async with asyncio.timeout(3):
+                    await session.request("UNSUBSCRIBE", url, headers={"SID": sid})
         except Exception as e:
-            _LOGGER.warning("UPnP renew error: %s, resubscribing", str(e))
-            self._upnp_sid = None
-            await self._subscribe_upnp_events()
+            _LOGGER.debug("UPnP unsubscribe error: %s", str(e))
+
+    async def _resubscribe_upnp_events(self):
+        """Replace the current subscription with a fresh one.
+
+        We do not renew via SID: this Linkplay firmware acks a SID renew with
+        200 but still drops the subscription on its own timer, so renews never
+        extend it. Instead we unsubscribe the old SID and create a brand-new
+        subscription before the device would drop the current one. Dropping the
+        old SID first keeps the device from accumulating stale subscriptions
+        (which would otherwise send duplicate NOTIFYs our handler rejects).
+        """
+        old_sid = self._upnp_sid
+        self._upnp_sid = None
+        await self._unsubscribe_upnp(old_sid)
+        await self._subscribe_upnp_events()
 
     async def _handle_upnp_event(self, request):
         """Handle incoming UPnP NOTIFY events."""
@@ -241,14 +293,7 @@ class Coordinator(DataUpdateCoordinator):
     async def _stop_upnp_listener(self):
         """Stop the UPnP event listener and unsubscribe."""
         if self._upnp_sid:
-            try:
-                url = f"http://{self.address}:59152/upnp/event/rendertransport1"
-                headers = {"SID": self._upnp_sid}
-                async with aiohttp.ClientSession() as session:
-                    async with asyncio.timeout(3):
-                        await session.request("UNSUBSCRIBE", url, headers=headers)
-            except Exception:
-                pass
+            await self._unsubscribe_upnp(self._upnp_sid)
             self._upnp_sid = None
 
         if self._upnp_runner:
@@ -258,8 +303,24 @@ class Coordinator(DataUpdateCoordinator):
 
     # --- Device setup ---
 
+    @staticmethod
+    def _build_ssl_context():
+        """Create the SSL context. Blocking (loads CA bundle), so run off-loop."""
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        return ssl_context
+
+    async def _ensure_ssl_context(self):
+        """Build the SSL context in an executor if it hasn't been built yet."""
+        if self.sslcontext is None:
+            self.sslcontext = await self.hass.async_add_executor_job(
+                self._build_ssl_context
+            )
+
     async def _SetupDeviceInfo(self):
         """Set up SSL certs and fetch device info."""
+        await self._ensure_ssl_context()
         cert_path = self.hass.config.path("custom_components/jbl_integration/Cert.pem")
         key_path = self.hass.config.path("custom_components/jbl_integration/Key.pem")
         await self.hass.async_add_executor_job(
@@ -370,10 +431,13 @@ class Coordinator(DataUpdateCoordinator):
     # --- Polling ---
 
     async def _async_update_data(self):
-        # Renew UPnP subscription every ~40 polls (~200 sec with 5 sec interval)
-        self._upnp_poll_count += 1
-        if self._upnp_poll_count >= 40:
-            await self._renew_upnp_subscription()
+        # Proactively replace the UPnP subscription once we pass a fraction of
+        # the granted lifetime (see _record_subscription). Time-based so it
+        # stays correct regardless of scan_interval or how long each poll takes.
+        if self._upnp_sub_time is not None and (
+            time.monotonic() - self._upnp_sub_time >= self._upnp_resubscribe_after
+        ):
+            await self._resubscribe_upnp_events()
 
         combined_data = {
             **await self.requestInfo(),
