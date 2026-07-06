@@ -30,7 +30,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {"coordinator": coordinator}
 
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "switch","number","button","binary_sensor","select"])
+    await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "switch", "number", "button", "select", "media_player"])
 
     # Start UPnP listener after everything is set up (non-critical, failures are logged)
     await coordinator._setup_upnp_listener()
@@ -75,8 +75,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     await hass.config_entries.async_forward_entry_unload(entry, "sensor")
     await hass.config_entries.async_forward_entry_unload(entry, "number")
     await hass.config_entries.async_forward_entry_unload(entry, "button")
-    await hass.config_entries.async_forward_entry_unload(entry, "binary_sensor")
     await hass.config_entries.async_forward_entry_unload(entry, "select")
+    await hass.config_entries.async_forward_entry_unload(entry, "media_player")
 
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     await coordinator._stop_upnp_listener()

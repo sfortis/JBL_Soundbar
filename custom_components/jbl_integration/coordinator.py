@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_UUID, CONF_ADDRESS, CONF_SCAN_INTERVAL
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.util import dt as dt_util
 from .const import DOMAIN
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -43,6 +44,12 @@ class Coordinator(DataUpdateCoordinator):
         self.sslcontext = ssl_context
 
         self._upnp_poll_count = 0
+        # Per-track position tracking — kept on the coordinator instance because
+        # DataUpdateCoordinator replaces self.data wholesale on every refresh.
+        self._position_offset = None
+        self._position_last_title = None
+        self._position_last_uri = None
+        self._position_updated_at = None
 
         if hass is not None and entry is not None:
             self._entry = entry
@@ -294,17 +301,13 @@ class Coordinator(DataUpdateCoordinator):
 
     async def _detect_capabilities(self):
         """Probe the device to determine which features are supported."""
-        # Map: capability name -> (API command, required response key)
-        # If the command returns "unknown command" or the key is missing, the feature is not supported
+        # Capability probes for features that vary across the Authentics line
+        # (200/300/500). Soundbar-specific features (atmos, rear, hdmi, smart_mode,
+        # bass_boost, calibration) are intentionally not probed since this
+        # integration targets standalone speakers.
         probes = {
-            "atmos": ("getAtmosLevel", "atmos_level"),
-            "rear_speakers": ("getRearSpeakerStatus", "rears"),
-            "smart_mode": ("getSmartMode", "status"),
             "night_mode": ("getPersonalListeningMode", "status"),
             "pure_voice": ("getPureVoiceState", "purevoice_state"),
-            "calibration": ("getCalibrationStatus", None),
-            "hdmi": ("getHdmiStatus", None),
-            "bass_boost": ("getBassBoostStatus", None),
         }
         self._capabilities = {}
         for cap, (command, required_key) in probes.items():
@@ -316,6 +319,16 @@ class Coordinator(DataUpdateCoordinator):
             else:
                 self._capabilities[cap] = True
             _LOGGER.debug("Capability %s: %s", cap, self._capabilities[cap])
+
+        # Power capability: only portable models with a battery support real power off.
+        # Mains-powered models (Authentics 200/300) crash when sent power commands.
+        status = await self._https_get("getStatusEx")
+        battery_percent = status.get("battery_percent") if status else None
+        try:
+            self._capabilities["power"] = battery_percent is not None and int(battery_percent) >= 0
+        except (TypeError, ValueError):
+            self._capabilities["power"] = False
+        _LOGGER.debug("Capability power: %s (battery_percent=%s)", self._capabilities["power"], battery_percent)
 
     def has_capability(self, capability):
         """Check if the device supports a specific capability."""
@@ -338,6 +351,22 @@ class Coordinator(DataUpdateCoordinator):
         payload = f'command=sendAppController&payload={{"key_pressed": "{command}"}}'
         await self._https_post(payload)
 
+    async def switchSource(self, mode: str):
+        """Switch input source via Linkplay setPlayerCmd:switchmode."""
+        url = f"https://{self.address}/httpapi.asp?command=setPlayerCmd:switchmode:{mode}"
+        session_kwargs = {"ssl": self.sslcontext}
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with asyncio.timeout(10):
+                    async with session.get(url, headers=HTTPS_HEADERS, **session_kwargs) as response:
+                        text = await response.text()
+                        if response.status != 200 or "OK" not in text and "error_code" not in text:
+                            _LOGGER.warning("switchSource(%s): %s -> %s", mode, response.status, text[:100])
+                        else:
+                            _LOGGER.debug("switchSource(%s) OK", mode)
+            except Exception as e:
+                _LOGGER.error("Error switching source to %s: %s", mode, str(e))
+
     # --- Polling ---
 
     async def _async_update_data(self):
@@ -348,19 +377,57 @@ class Coordinator(DataUpdateCoordinator):
 
         combined_data = {
             **await self.requestInfo(),
+            **await self.getPlayerStatus(),
             **await self._getEQData(),
             **await self.getNightMode(),
-            **await self.getRearSpeaker(),
-            **await self.getSmartMode(),
             **await self.getPureVoice(),
             **await self.getSleepTimer(),
             **await self.getNetworkInfo(),
         }
 
-        if self.data is None:
-            self.data = {}
+        # Per-track position offset.
+        # The device's curpos counts up cumulatively within a continuous stream
+        # (e.g. Music Assistant flow mode). When the track changes (DIDL title
+        # or track URI), capture the curpos so we can compute per-track elapsed
+        # time as (curpos - offset). State lives on the coordinator instance,
+        # because DataUpdateCoordinator replaces self.data wholesale.
+        new_title = combined_data.get("media_title")
+        new_uri = combined_data.get("track")
+        new_curpos = combined_data.get("track_position_seconds")
 
-        self.data.update(combined_data)
+        if new_curpos is not None:
+            # Track change requires BOTH old and new identifiers to be known and
+            # different — a None on either side just means metadata is missing.
+            title_changed = (
+                self._position_last_title is not None
+                and new_title is not None
+                and self._position_last_title != new_title
+            )
+            uri_changed = (
+                self._position_last_uri is not None
+                and new_uri is not None
+                and self._position_last_uri != new_uri
+            )
+            track_changed = title_changed or uri_changed
+
+            if self._position_offset is None or track_changed:
+                self._position_offset = new_curpos
+
+            track_pos = max(0, new_curpos - self._position_offset)
+            duration = combined_data.get("media_track_duration")
+            if duration and track_pos > duration + 5:
+                combined_data["media_position"] = None
+            else:
+                combined_data["media_position"] = track_pos
+                self._position_updated_at = dt_util.utcnow()
+                combined_data["_position_updated_at"] = self._position_updated_at
+
+            # Track the latest known identifiers, but don't overwrite with None
+            if new_title is not None:
+                self._position_last_title = new_title
+            if new_uri is not None:
+                self._position_last_uri = new_uri
+
         return combined_data
 
     # --- Device info fetchers ---
@@ -423,7 +490,7 @@ class Coordinator(DataUpdateCoordinator):
         try:
             root = ET.fromstring(response_text)
             prefix = './/u:GetInfoExResponse/'
-            return {
+            data = {
                 "play_medium": root.find(f'{prefix}PlayMedium', namespaces).text,
                 "volume_level": root.find(f'{prefix}CurrentVolume', namespaces).text,
                 "track": root.find(f'{prefix}TrackURI', namespaces).text,
@@ -434,24 +501,130 @@ class Coordinator(DataUpdateCoordinator):
                 "channel": root.find(f'{prefix}CurrentChannel', namespaces).text,
                 "slaves": root.find(f'{prefix}SlaveFlag', namespaces).text,
             }
+            # Track position (RelTime field)
+            rel_time = root.find(f'{prefix}RelTime', namespaces)
+            if rel_time is not None and rel_time.text and rel_time.text != "NOT_IMPLEMENTED":
+                data["track_position"] = rel_time.text
+            # Parse DIDL-Lite metadata for title, artist, album, album art
+            metadata_elem = root.find(f'{prefix}TrackMetaData', namespaces)
+            if metadata_elem is not None and metadata_elem.text:
+                data.update(self._parse_didl_metadata(metadata_elem.text))
+            return data
         except AttributeError:
             _LOGGER.error("Could not find necessary data in the response")
             return {}
 
-    async def setVolume(self, value: float):
-        """Set volume via UPnP SOAP."""
-        payload_xml = f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
-        <s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-        <s:Body><u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">
-        <InstanceID>0</InstanceID><Channel>Single</Channel>
-        <DesiredVolume>{round(value)}</DesiredVolume>
-        </u:SetVolume></s:Body></s:Envelope>"""
+    def _parse_didl_metadata(self, didl_xml: str) -> dict:
+        """Parse DIDL-Lite XML metadata using regex (avoids namespace issues)."""
+        import html
+        import re
 
+        result = {
+            "media_title": None,
+            "media_artist": None,
+            "media_album": None,
+            "media_image_url": None,
+            "media_track_duration": None,
+        }
+
+        if not didl_xml:
+            return result
+
+        def extract(tag):
+            """Extract text content of <tag>...</tag>, namespace-agnostic."""
+            match = re.search(
+                rf'<(?:[a-zA-Z]+:)?{tag}\b[^>]*>([^<]*)</(?:[a-zA-Z]+:)?{tag}>',
+                didl_xml,
+            )
+            return html.unescape(match.group(1)).strip() if match else None
+
+        def clean(value):
+            if not value or value.lower() in ("un_known", "unknown"):
+                return None
+            return value
+
+        title = clean(extract("title"))
+        if title:
+            result["media_title"] = title
+
+        # Prefer upnp:artist over dc:creator if both exist
+        artist = clean(extract("artist")) or clean(extract("creator"))
+        if artist:
+            result["media_artist"] = artist
+
+        album = clean(extract("album"))
+        if album:
+            result["media_album"] = album
+
+        art = extract("albumArtURI")
+        # Soundbar returns "un_known" as a placeholder in idle/unknown state
+        if art and art.lower() not in ("un_known", "unknown", ""):
+            result["media_image_url"] = art
+
+        # Duration is an attribute on <res duration="...">
+        res_match = re.search(r'<res\b[^>]*\bduration="([^"]+)"', didl_xml)
+        if res_match:
+            duration = res_match.group(1)
+            if duration and duration != "00:00:00":
+                parts = duration.split(":")
+                if len(parts) == 3:
+                    try:
+                        result["media_track_duration"] = (
+                            int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+                        )
+                    except ValueError:
+                        pass
+        return result
+
+    async def setPlayerCmd(self, action: str):
+        """Send a Linkplay player command (play, pause, stop, next, prev, resume, onepause)."""
+        url = f"https://{self.address}/httpapi.asp?command=setPlayerCmd:{action}"
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with asyncio.timeout(10):
+                    async with session.get(url, headers=HTTPS_HEADERS, ssl=self.sslcontext) as response:
+                        text = await response.text()
+                        if response.status != 200 or "OK" not in text:
+                            _LOGGER.warning("setPlayerCmd:%s -> %s: %s", action, response.status, text[:80])
+            except Exception as e:
+                _LOGGER.error("setPlayerCmd:%s error: %s", action, e)
+
+    async def setAVTransportURI(self, uri: str, metadata: str = ""):
+        """Set the URI to play via UPnP SOAP (used by play_media)."""
+        # Escape XML special chars in URI and metadata
+        import html
+        safe_uri = html.escape(uri, quote=True)
+        safe_meta = html.escape(metadata, quote=True) if metadata else ""
+        body = (
+            '<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            '<InstanceID>0</InstanceID>'
+            f'<CurrentURI>{safe_uri}</CurrentURI>'
+            f'<CurrentURIMetaData>{safe_meta}</CurrentURIMetaData>'
+            '</u:SetAVTransportURI>'
+        )
+        payload_xml = f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>{body}</s:Body></s:Envelope>"""
         await self._soap_request(
-            59152, "/upnp/control/rendercontrol1",
-            "SetVolume", "urn:schemas-upnp-org:service:RenderingControl:1",
+            59152, "/upnp/control/rendertransport1",
+            "SetAVTransportURI", "urn:schemas-upnp-org:service:AVTransport:1",
             payload_xml,
         )
+
+    async def setVolume(self, value: float):
+        """Set volume via Linkplay HTTPS API."""
+        await self.setPlayerCmd(f"vol:{max(0, min(100, round(value)))}")
+
+    async def setMute(self, mute: bool):
+        """Set mute via Linkplay HTTPS API."""
+        await self.setPlayerCmd(f"mute:{'1' if mute else '0'}")
+
+    async def seek(self, position_seconds: int):
+        """Seek to position (seconds) via Linkplay HTTPS API."""
+        await self.setPlayerCmd(f"seek:{int(position_seconds)}")
+        # The device resets curpos to the seeked-to position, so our per-track
+        # offset must be 0 for the computed track_pos to match what the user wants.
+        self._position_offset = 0
 
     # --- EQ (single call for both bands and presets) ---
 
@@ -570,6 +743,21 @@ class Coordinator(DataUpdateCoordinator):
         _LOGGER.debug("Setting EQ preset: %s", payload_data)
         await self._https_post(f"command=setActiveEQ&payload={payload_data}")
 
+    # --- Player position ---
+
+    async def getPlayerStatus(self):
+        """Get current playback position from HTTPS API (curpos in milliseconds)."""
+        response = await self._https_get("getPlayerStatus")
+        if not response:
+            return {}
+        try:
+            curpos = response.get("curpos")
+            if curpos is not None:
+                return {"track_position_seconds": int(curpos) // 1000}
+        except (ValueError, TypeError):
+            pass
+        return {}
+
     # --- Mode getters/setters ---
 
     async def getNightMode(self):
@@ -581,18 +769,6 @@ class Coordinator(DataUpdateCoordinator):
     async def setNightMode(self, value: bool):
         strvalue = "on" if value else "off"
         await self._https_post(f'command=setPersonalListeningMode&payload={{"status":"{strvalue}"}}')
-
-    async def getRearSpeaker(self):
-        response = await self._https_get("getRearSpeakerStatus")
-        if "rears" in response:
-            return {"Rears": response["rears"]}
-        return {}
-
-    async def getSmartMode(self):
-        response = await self._https_get("getSmartMode")
-        if "status" in response:
-            return {"SmartMode": response["status"]}
-        return {}
 
     async def getPureVoice(self):
         response = await self._https_get("getPureVoiceState")
@@ -607,16 +783,24 @@ class Coordinator(DataUpdateCoordinator):
     # --- Sleep Timer ---
 
     async def getSleepTimer(self):
+        # API reports values in seconds; convert to minutes for the UI.
         response = await self._https_get("getSleepTimer")
         if "sleep_timer" in response:
+            try:
+                seconds_set = int(response.get("sleep_timer", 0))
+                seconds_left = int(response.get("remain_time", 0))
+            except (TypeError, ValueError):
+                return {}
             return {
-                "sleep_timer": int(response.get("sleep_timer", 0)),
-                "sleep_remain": int(response.get("remain_time", 0)),
+                "sleep_timer": seconds_set // 60,
+                "sleep_remain": seconds_left,  # keep remaining in seconds for accuracy
             }
         return {}
 
     async def setSleepTimer(self, minutes: int):
-        await self._https_post(f'command=setSleepTimer&payload={{"sleep_timer":"{minutes}"}}')
+        # API expects seconds.
+        seconds = max(0, int(minutes) * 60)
+        await self._https_post(f'command=setSleepTimer&payload={{"sleep_timer":"{seconds}"}}')
 
     # --- Network / Group info ---
 

@@ -16,34 +16,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
 
-    # Always available buttons
+    # The "Moment" button is unique to Authentics speakers (heart icon, plays a
+    # configured favorite). All playback / volume / source actions are exposed
+    # through the media_player entity instead.
     entities = [
-        JBLButton(coordinator,entry,"power","Power","mdi:power"),
-        JBLButton(coordinator,entry,"mute","Mute","mdi:volume-off"),
-        JBLButton(coordinator,entry,"volumeUp","Increase Volume","mdi:volume-plus"),
-        JBLButton(coordinator,entry,"volumeDown","Lower Volume","mdi:volume-minus"),
-        JBLButton(coordinator,entry,"musicPlayPause","Play Pause","mdi:play-pause"),
-        JBLButton(coordinator,entry,"smart_triger","Moment","mdi:heart-box"),
-        JBLButton(coordinator,entry,"bluetooth","Bluetooth","mdi:bluetooth"),
+        JBLButton(coordinator, entry, "smart_triger", "Moment", "mdi:heart-box"),
     ]
 
-    # Capability-dependent buttons
-    cap_buttons = {
-        "calibration": ("calibration", "Calibration", "mdi:calculator-variant"),
-        "rear_speakers": ("keyRear", "Rear", "mdi:numeric-2-box-multiple"),
-        "bass_boost": ("bassboost", "Bass", "mdi:equalizer"),
-        "atmos": ("keyAtmosLevel", "Atmos", "mdi:equalizer"),
-        "hdmi": ("source-hdmi-switch", "HDMI", "mdi:video-input-hdmi"),
-        "smart_mode": ("surround", "Smart Mode", "mdi:surround-sound"),
-    }
-    # Only add source-tv if HDMI is supported (soundbar models)
-    if coordinator.has_capability("hdmi"):
-        cap_buttons["hdmi_tv"] = ("source-tv", "TV", "mdi:television-box")
-
-    for cap, (cmd, name, icon) in cap_buttons.items():
-        cap_key = cap if cap != "hdmi_tv" else "hdmi"
-        if coordinator.has_capability(cap_key):
-            entities.append(JBLButton(coordinator, entry, cmd, name, icon))
+    if coordinator.has_capability("power"):
+        entities.insert(0, JBLButton(coordinator, entry, "power", "Power", "mdi:power"))
 
     async_add_entities(entities)
 
