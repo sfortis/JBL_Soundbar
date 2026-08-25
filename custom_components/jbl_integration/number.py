@@ -1,10 +1,9 @@
 """Number platform for JBL integration."""
-import async_timeout
+import asyncio
 import logging
 from homeassistant.components.number import NumberEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.event import async_track_state_change
 
 from .const import DOMAIN
 from .coordinator import Coordinator
@@ -19,9 +18,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entityArray = []
     entityArray.append(JBLVolumeNumber(entry, coordinator))
     if coordinator.newFirmware:
-        entityArray.append(JBLEqNumber(entry, coordinator," 125Hz"))
-        entityArray.append(JBLEqNumber(entry, coordinator," 250Hz"))
-        entityArray.append(JBLEqNumber(entry, coordinator," 500Hz"))
+        entityArray.append(JBLEqNumber(entry, coordinator,"125Hz"))
+        entityArray.append(JBLEqNumber(entry, coordinator,"250Hz"))
+        entityArray.append(JBLEqNumber(entry, coordinator,"500Hz"))
         entityArray.append(JBLEqNumber(entry, coordinator,"1000Hz"))
         entityArray.append(JBLEqNumber(entry, coordinator,"2000Hz"))
         entityArray.append(JBLEqNumber(entry, coordinator,"4000Hz"))
@@ -30,7 +29,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entityArray.append(JBLEqNumber(entry, coordinator,"EQ_1_Low"))
         entityArray.append(JBLEqNumber(entry, coordinator,"EQ_2_Mid"))
         entityArray.append(JBLEqNumber(entry, coordinator,"EQ_3_High"))
-    
+
+    entityArray.append(JBLSleepTimerNumber(entry, coordinator))
+
     async_add_entities(entityArray)
 
 
@@ -98,6 +99,7 @@ class JBLVolumeNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float):
         await self.coordinator.setVolume(value)
+        await asyncio.sleep(1)
         await self.coordinator.async_request_refresh()
 
     async def async_added_to_hass(self):
@@ -108,6 +110,71 @@ class JBLVolumeNumber(NumberEntity):
         """Update the sensor."""
         await self.coordinator.async_request_refresh()
 
+
+class JBLSleepTimerNumber(NumberEntity):
+    """Number entity to set the sleep timer in minutes."""
+
+    def __init__(self, entry: ConfigEntry, coordinator: Coordinator):
+        self._entry = entry
+        self.coordinator = coordinator
+        self.entity_id = build_entity_id(
+            "number",
+            self.coordinator.device_info.get("name", "jbl_integration"),
+            "sleep_timer",
+        )
+
+    @property
+    def name(self):
+        return "Sleep Timer"
+
+    @property
+    def unique_id(self):
+        return f"jbl_sleep_timer_{self._entry.entry_id}"
+
+    @property
+    def icon(self):
+        return "mdi:timer-outline"
+
+    @property
+    def device_info(self):
+        return self.coordinator.device_info
+
+    @property
+    def native_min_value(self):
+        return 0
+
+    @property
+    def native_max_value(self):
+        return 120
+
+    @property
+    def native_step(self):
+        return 1
+
+    @property
+    def native_value(self):
+        return self.coordinator.data.get("sleep_timer", 0)
+
+    @property
+    def native_unit_of_measurement(self):
+        return "min"
+
+    @property
+    def should_poll(self):
+        return False
+
+    async def async_set_native_value(self, value: float):
+        await self.coordinator.setSleepTimer(int(value))
+        self.coordinator.data["sleep_timer"] = int(value)
+        self.async_write_ha_state()
+        await asyncio.sleep(1)
+        await self.coordinator.async_request_refresh()
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
+
+    async def async_update(self):
+        await self.coordinator.async_request_refresh()
 class JBLEqNumber(NumberEntity):
     """Representation of a number to control the EQ."""
 
@@ -147,7 +214,7 @@ class JBLEqNumber(NumberEntity):
     @property
     def native_min_value(self):
         """Return the minimum value."""
-        minValue = -6 if ("EQ_1_Low" != self.entityName and " 125Hz" != self.entityName) else -9
+        minValue = -6 if ("EQ_1_Low" != self.entityName and "125Hz" != self.entityName) else -9
         return minValue
 
     @property
@@ -177,6 +244,10 @@ class JBLEqNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float):
         await self.coordinator.setEQ(value,self.entityName.strip())
+        # Optimistic update for instant UI feedback
+        self.coordinator.data[self.entityName.strip()] = value
+        self.async_write_ha_state()
+        await asyncio.sleep(1)
         await self.coordinator.async_request_refresh()
 
     async def async_added_to_hass(self):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re  # For IP address validation
+from typing import Any
 
 import voluptuous as vol
 from awesomeversion import AwesomeVersion

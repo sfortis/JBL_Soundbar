@@ -1,5 +1,4 @@
 """Button platform for JBL integration."""
-import async_timeout
 import logging
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -17,22 +16,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
 
-    async_add_entities([
-        JBLButton(coordinator,entry,"power","Power","mdi:power"),
-        JBLButton(coordinator,entry,"mute","Mute","mdi:volume-off"),
-        JBLButton(coordinator,entry,"volumeUp","Increase Volume","mdi:volume-plus"),
-        JBLButton(coordinator,entry,"volumeDown","Lower Volume","mdi:volume-minus"),
-        JBLButton(coordinator,entry,"musicPlayPause","Play/Pause","mdi:play-pause"),
-        JBLButton(coordinator,entry,"smart_triger","Moment","mdi:heart-box"),
-        JBLButton(coordinator,entry,"calibration","Calibration","mdi:calculator-variant"),
-        JBLButton(coordinator,entry,"keyRear","Rear","mdi:numeric-2-box-multiple"),
-        JBLButton(coordinator,entry,"bassboost","Bass","mdi:equalizer"),
-        JBLButton(coordinator,entry,"keyAtmosLevel","Atmos","mdi:equalizer"),
-        JBLButton(coordinator,entry,"source-hdmi-switch","HDMI","mdi:video-input-hdmi"),
-        JBLButton(coordinator,entry,"bluetooth","Bluetooth","mdi:bluetooth"),
-        JBLButton(coordinator,entry,"source-tv","TV","mdi:television-box"),
-        JBLButton(coordinator,entry,"surround","Smart Mode","mdi:surround-sound"),
-    ])
+    # The "Moment" button is unique to Authentics speakers (heart icon, plays a
+    # configured favorite). All playback / volume / source actions are exposed
+    # through the media_player entity instead.
+    entities = [
+        JBLButton(coordinator, entry, "smart_triger", "Moment", "mdi:heart-box"),
+    ]
+
+    if coordinator.has_capability("power"):
+        entities.insert(0, JBLButton(coordinator, entry, "power", "Power", "mdi:power"))
+
+    async_add_entities(entities)
 
 class JBLButton(ButtonEntity):
     """Base class for a JBL button."""
@@ -79,5 +73,3 @@ class JBLButton(ButtonEntity):
     async def async_press(self) -> None:
         """Handle the button press."""
         await self.coordinator._send_command(self.actionstring)
-
-        

@@ -1,34 +1,78 @@
-"""Sensor platform for JBL integration."""
+"""Coordinator for JBL integration."""
 import asyncio
 import aiohttp
+from aiohttp import web
 import json
 import logging
+import time
 import urllib3
 import ssl
 import certifi
+import socket
 from datetime import timedelta
+from xml.etree import ElementTree as ET
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_UUID, CONF_ADDRESS, CONF_SCAN_INTERVAL
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.util import dt as dt_util
 from .const import DOMAIN
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _LOGGER = logging.getLogger(__name__)
 
+HTTPS_HEADERS = {"Accept-Encoding": "gzip"}
+
+# UPnP event subscription lifetime we request from the device (seconds). The
+# device may grant a shorter window in its SUBSCRIBE response TIMEOUT header,
+# which is why we read it back rather than assuming this value holds.
+UPNP_SUBSCRIBE_TIMEOUT = 300
+# Replace the subscription with a fresh one at this fraction of the granted
+# timeout. We deliberately do NOT use SID-based SUBSCRIBE renewals: this
+# Linkplay firmware answers a renew with 200 but still drops the subscription
+# on its own internal timer (~460s observed), so renews never actually extend
+# it. A fresh SUBSCRIBE (new SID) is handled reliably, so we proactively
+# resubscribe well before the device would drop the current one.
+UPNP_RESUBSCRIBE_FRACTION = 0.85
+# Never resubscribe more aggressively than this, even if the device grants a
+# tiny window, to avoid a busy loop.
+UPNP_MIN_RESUBSCRIBE_AFTER = 30
+
+
 class Coordinator(DataUpdateCoordinator):
     """Class to manage fetching data from the API."""
+
+    # UPnP tag -> coordinator data key mapping
+    _UPNP_TAG_MAP = {
+        "TransportState": "transport_state",
+        "CurrentTrackDuration": "track_duration",
+        "CurrentMediaDuration": "track_duration",
+    }
 
     def __init__(self, address, scan_interval, hass=None, entry=None):
         """Initialize the coordinator."""
         self.address = address
         self.pollingRate = scan_interval
         self.data = {}
+        # Built lazily off the event loop (see _ensure_ssl_context): creating a
+        # default SSL context loads the certifi CA bundle from disk, which is
+        # blocking I/O and must not run in the event loop.
+        self.sslcontext = None
 
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        self.sslcontext = ssl_context
-    
-        if hass != None and entry != None:
+        # UPnP subscription refresh is driven by wall-clock time (monotonic),
+        # not poll count: each poll runs several sequential HTTP/SOAP calls, so
+        # the real interval between polls is well above scan_interval and a
+        # count-based schedule would drift past the subscription's expiry.
+        self._upnp_sub_time = None
+        self._upnp_timeout = UPNP_SUBSCRIBE_TIMEOUT
+        self._upnp_resubscribe_after = UPNP_SUBSCRIBE_TIMEOUT * UPNP_RESUBSCRIBE_FRACTION
+        # Per-track position tracking — kept on the coordinator instance because
+        # DataUpdateCoordinator replaces self.data wholesale on every refresh.
+        self._position_offset = None
+        self._position_last_title = None
+        self._position_last_uri = None
+        self._position_updated_at = None
+
+        if hass is not None and entry is not None:
             self._entry = entry
             self.hass = hass
             super().__init__(
@@ -39,32 +83,268 @@ class Coordinator(DataUpdateCoordinator):
                 update_interval=timedelta(seconds=int(scan_interval)),
             )
 
+    # --- Generic HTTP helpers ---
+
+    async def _https_get(self, command):
+        """Send a GET command to the HTTPS API and return parsed JSON."""
+        url = f"https://{self.address}/httpapi.asp?command={command}"
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with asyncio.timeout(10):
+                    async with session.get(url, headers=HTTPS_HEADERS, ssl=self.sslcontext) as response:
+                        if response.status == 200:
+                            response_text = await response.text()
+                            if response_text == "unknown command":
+                                _LOGGER.debug("%s: unsupported command", command)
+                                return {}
+                            _LOGGER.debug("%s Response: %s", command, response_text)
+                            return json.loads(response_text)
+                        else:
+                            _LOGGER.error("Failed to get %s: %s", command, response.status)
+                            return {}
+            except Exception as e:
+                _LOGGER.error("Error getting %s: %s", command, str(e))
+                return {}
+
+    async def _https_post(self, payload):
+        """Send a POST command to the HTTPS API."""
+        url = f"https://{self.address}/httpapi.asp"
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with asyncio.timeout(10):
+                    async with session.post(url, headers=HTTPS_HEADERS, data=payload, ssl=self.sslcontext) as response:
+                        if response.status != 200:
+                            _LOGGER.error("Failed to post command: %s", response.status)
+            except Exception as e:
+                _LOGGER.error("Error posting command: %s", str(e))
+
+    async def _soap_request(self, port, control_url, action, service, payload_xml):
+        """Send a SOAP request and return the response text."""
+        url = f"http://{self.address}:{port}{control_url}"
+        headers = {
+            "Content-type": 'text/xml;charset="utf-8"',
+            "Soapaction": f'"{service}#{action}"',
+        }
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with asyncio.timeout(10):
+                    async with session.post(url, headers=headers, data=payload_xml) as response:
+                        if response.status == 200:
+                            return await response.text()
+                        else:
+                            _LOGGER.error("SOAP %s failed: %s", action, response.status)
+                            return None
+            except Exception as e:
+                _LOGGER.error("SOAP %s error: %s", action, str(e))
+                return None
+
+    # --- UPnP event subscription ---
+
+    async def _setup_upnp_listener(self):
+        """Set up a small HTTP server to receive UPnP event callbacks."""
+        self._upnp_runner = None
+        self._upnp_sid = None
+        self._upnp_port = None
+
+        try:
+            local_ip = await self.hass.async_add_executor_job(self._get_local_ip)
+
+            app = web.Application()
+            app.router.add_route("NOTIFY", "/upnp/callback", self._handle_upnp_event)
+            self._upnp_runner = web.AppRunner(app)
+            await self._upnp_runner.setup()
+            site = web.TCPSite(self._upnp_runner, "0.0.0.0", 0)
+            await site.start()
+            sockets = site._server.sockets
+            self._upnp_port = sockets[0].getsockname()[1] if sockets else 0
+            self._callback_url = f"http://{local_ip}:{self._upnp_port}/upnp/callback"
+            _LOGGER.debug("UPnP event listener started on port %s", self._upnp_port)
+
+            await self._subscribe_upnp_events()
+        except Exception as e:
+            _LOGGER.warning("Failed to start UPnP event listener: %s", str(e))
+            await self._stop_upnp_listener()
+
+    def _get_local_ip(self):
+        """Get the local IP address that can reach the soundbar."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((self.address, 59152))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+
+    def _parse_timeout_seconds(self, header_value):
+        """Parse a UPnP TIMEOUT header ('Second-300' / 'Second-infinite')."""
+        if not header_value:
+            return UPNP_SUBSCRIBE_TIMEOUT
+        value = header_value.strip()
+        if value.lower().startswith("second-"):
+            value = value.split("-", 1)[1]
+        if value.lower() == "infinite":
+            return UPNP_SUBSCRIBE_TIMEOUT
+        try:
+            seconds = int(value)
+            return seconds if seconds > 0 else UPNP_SUBSCRIBE_TIMEOUT
+        except ValueError:
+            return UPNP_SUBSCRIBE_TIMEOUT
+
+    def _record_subscription(self, resp):
+        """Record the granted subscription lifetime and reset the refresh clock.
+
+        The device may grant a shorter TIMEOUT than we requested, so we schedule
+        the next resubscribe at a fraction of whatever it actually gave us.
+        """
+        self._upnp_timeout = self._parse_timeout_seconds(resp.headers.get("TIMEOUT"))
+        self._upnp_resubscribe_after = max(
+            UPNP_MIN_RESUBSCRIBE_AFTER, self._upnp_timeout * UPNP_RESUBSCRIBE_FRACTION
+        )
+        self._upnp_sub_time = time.monotonic()
+
+    async def _subscribe_upnp_events(self):
+        """Subscribe to AVTransport UPnP events."""
+        url = f"http://{self.address}:59152/upnp/event/rendertransport1"
+        headers = {
+            "CALLBACK": f"<{self._callback_url}>",
+            "NT": "upnp:event",
+            "TIMEOUT": f"Second-{UPNP_SUBSCRIBE_TIMEOUT}",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+              async with asyncio.timeout(5):
+                async with session.request("SUBSCRIBE", url, headers=headers) as resp:
+                    if resp.status == 200:
+                        self._upnp_sid = resp.headers.get("SID")
+                        self._record_subscription(resp)
+                        _LOGGER.debug(
+                            "UPnP subscribed, SID: %s (timeout %ss, resubscribe in %ss)",
+                            self._upnp_sid, self._upnp_timeout, int(self._upnp_resubscribe_after),
+                        )
+                    else:
+                        _LOGGER.debug("UPnP subscribe failed: %s", resp.status)
+        except Exception as e:
+            _LOGGER.debug("UPnP subscribe error: %s", str(e))
+
+    async def _unsubscribe_upnp(self, sid):
+        """Send a best-effort UNSUBSCRIBE for the given SID."""
+        if not sid:
+            return
+        url = f"http://{self.address}:59152/upnp/event/rendertransport1"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with asyncio.timeout(3):
+                    await session.request("UNSUBSCRIBE", url, headers={"SID": sid})
+        except Exception as e:
+            _LOGGER.debug("UPnP unsubscribe error: %s", str(e))
+
+    async def _resubscribe_upnp_events(self):
+        """Replace the current subscription with a fresh one.
+
+        We do not renew via SID: this Linkplay firmware acks a SID renew with
+        200 but still drops the subscription on its own timer, so renews never
+        extend it. Instead we unsubscribe the old SID and create a brand-new
+        subscription before the device would drop the current one. Dropping the
+        old SID first keeps the device from accumulating stale subscriptions
+        (which would otherwise send duplicate NOTIFYs our handler rejects).
+        """
+        old_sid = self._upnp_sid
+        self._upnp_sid = None
+        await self._unsubscribe_upnp(old_sid)
+        await self._subscribe_upnp_events()
+
+    async def _handle_upnp_event(self, request):
+        """Handle incoming UPnP NOTIFY events."""
+        import re
+
+        event_sid = request.headers.get("SID", "")
+        if self._upnp_sid and event_sid != self._upnp_sid:
+            return web.Response(status=412, text="SID mismatch")
+
+        try:
+            body = await request.text()
+            _LOGGER.debug("UPnP event received: %s", body[:500])
+
+            # Use regex to extract values from the XML/HTML-encoded body
+            # This avoids XML namespace parsing issues entirely
+            updated = False
+            for upnp_tag, data_key in self._UPNP_TAG_MAP.items():
+                match = re.search(
+                    rf'&lt;{upnp_tag}\s+val=&quot;([^&]*)&quot;', body
+                )
+                if not match:
+                    match = re.search(
+                        rf'<{upnp_tag}\s+val="([^"]*)"', body
+                    )
+                if match:
+                    val = match.group(1)
+                    if val != self.data.get(data_key):
+                        self.data[data_key] = val
+                        updated = True
+                        _LOGGER.debug("UPnP instant update: %s = %s", data_key, val)
+
+            if updated:
+                self.async_set_updated_data(dict(self.data))
+
+        except Exception as e:
+            _LOGGER.warning("Error handling UPnP event: %s", str(e))
+
+        return web.Response(text="OK")
+
+    async def _stop_upnp_listener(self):
+        """Stop the UPnP event listener and unsubscribe."""
+        if self._upnp_sid:
+            await self._unsubscribe_upnp(self._upnp_sid)
+            self._upnp_sid = None
+
+        if self._upnp_runner:
+            await self._upnp_runner.cleanup()
+            self._upnp_runner = None
+            _LOGGER.debug("UPnP event listener stopped")
+
+    # --- Device setup ---
+
+    @staticmethod
+    def _build_ssl_context():
+        """Create the SSL context. Blocking (loads CA bundle), so run off-loop."""
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        return ssl_context
+
+    async def _ensure_ssl_context(self):
+        """Build the SSL context in an executor if it hasn't been built yet."""
+        if self.sslcontext is None:
+            self.sslcontext = await self.hass.async_add_executor_job(
+                self._build_ssl_context
+            )
+
     async def _SetupDeviceInfo(self):
-        #Setting up cert        
+        """Set up SSL certs and fetch device info."""
+        await self._ensure_ssl_context()
         cert_path = self.hass.config.path("custom_components/jbl_integration/Cert.pem")
         key_path = self.hass.config.path("custom_components/jbl_integration/Key.pem")
-        self.sslcontext.load_cert_chain(certfile=cert_path, keyfile=key_path)
-        
-        device_info = await self.getDeviceInfo()
-        device_Type = await self.getDeviceType() 
+        await self.hass.async_add_executor_job(
+            self.sslcontext.load_cert_chain, cert_path, key_path
+        )
 
-        # Ensure device_info has all the expected keys and provide fallback values if necessary
+        device_info = await self.getDeviceInfo()
+        device_Type = await self.getDeviceType()
+
         mac_address = device_info.get("wlan0_mac", "unknown_mac")
         uuid = device_info.get("uuid", "unknown_uuid")
         device_name = device_info.get("name", "Unknow_name")
         serial_number = device_info.get("serial_number", "unknown_serial")
         firmware_version = device_info.get("firmware", "unknown_firmware")
-        ip_address = device_info.get("apcli0", "unknown_address")
         model = device_Type.get("hm_product_name", "unknown_product")
         hw_version = device_Type.get("hardware", "unknown_hardware")
 
         self._device_info = {
             "identifiers": {
                 (DOMAIN, self._entry.entry_id),
-                (DOMAIN, mac_address,uuid),
+                (DOMAIN, mac_address, uuid),
                 (DOMAIN, str(uuid).replace("-", "")),
                 (DOMAIN, self.address),
-                },
+            },
             "name": device_name,
             "manufacturer": "HARMAN International Industries",
             "model": model,
@@ -73,501 +353,538 @@ class Coordinator(DataUpdateCoordinator):
             "serial_number": serial_number,
         }
         try:
-            self._newFirmware = int(firmware_version.split('.')[0])>24 or int(firmware_version.split('.')[2])>31
+            self._newFirmware = int(firmware_version.split('.')[0]) > 24 or int(firmware_version.split('.')[2]) > 31
             _LOGGER.debug("JBL one 3.0 Detected" if self._newFirmware else "Older firmware then JBL one 3.0")
-        except Exception as e:
+        except Exception:
             self._newFirmware = False
-            
+
+        await self._detect_capabilities()
+
+    async def _detect_capabilities(self):
+        """Probe the device to determine which features are supported."""
+        # Capability probes for features that vary across the Authentics line
+        # (200/300/500). Soundbar-specific features (atmos, rear, hdmi, smart_mode,
+        # bass_boost, calibration) are intentionally not probed since this
+        # integration targets standalone speakers.
+        probes = {
+            "night_mode": ("getPersonalListeningMode", "status"),
+            "pure_voice": ("getPureVoiceState", "purevoice_state"),
+        }
+        self._capabilities = {}
+        for cap, (command, required_key) in probes.items():
+            response = await self._https_get(command)
+            if not response:
+                self._capabilities[cap] = False
+            elif required_key:
+                self._capabilities[cap] = required_key in response
+            else:
+                self._capabilities[cap] = True
+            _LOGGER.debug("Capability %s: %s", cap, self._capabilities[cap])
+
+        # Power capability: only portable models with a battery support real power off.
+        # Mains-powered models (Authentics 200/300) crash when sent power commands.
+        status = await self._https_get("getStatusEx")
+        battery_percent = status.get("battery_percent") if status else None
+        try:
+            self._capabilities["power"] = battery_percent is not None and int(battery_percent) >= 0
+        except (TypeError, ValueError):
+            self._capabilities["power"] = False
+        _LOGGER.debug("Capability power: %s (battery_percent=%s)", self._capabilities["power"], battery_percent)
+
+    def has_capability(self, capability):
+        """Check if the device supports a specific capability."""
+        return self._capabilities.get(capability, False)
+
     @property
     def device_info(self):
         """Return device information about this entity."""
         return self._device_info
-    
+
     @property
     def newFirmware(self):
-        """Return if the JBL is part of the JBL one 3.0 software"""
+        """Return if the JBL is part of the JBL one 3.0 software."""
         return self._newFirmware
 
-    async def _UpdatePollingrate(self,pollingRate):
-        self.update_interval = pollingRate
+    # --- Commands ---
 
     async def _send_command(self, command):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        """Send a command to the device."""
-        url = f'https://{self.address}/httpapi.asp'
+        """Send a key press command to the device."""
         payload = f'command=sendAppController&payload={{"key_pressed": "{command}"}}'
+        await self._https_post(payload)
+
+    async def switchSource(self, mode: str):
+        """Switch input source via Linkplay setPlayerCmd:switchmode."""
+        url = f"https://{self.address}/httpapi.asp?command=setPlayerCmd:switchmode:{mode}"
+        session_kwargs = {"ssl": self.sslcontext}
         async with aiohttp.ClientSession() as session:
-            async with asyncio.timeout(10):
-                async with session.post(url, data=payload,  ssl=self.sslcontext) as response:
-                    if response.status != 200:
-                        _LOGGER.error("Failed to send command: %s", response.status)
+            try:
+                async with asyncio.timeout(10):
+                    async with session.get(url, headers=HTTPS_HEADERS, **session_kwargs) as response:
+                        text = await response.text()
+                        if response.status != 200 or "OK" not in text and "error_code" not in text:
+                            _LOGGER.warning("switchSource(%s): %s -> %s", mode, response.status, text[:100])
+                        else:
+                            _LOGGER.debug("switchSource(%s) OK", mode)
+            except Exception as e:
+                _LOGGER.error("Error switching source to %s: %s", mode, str(e))
+
+    # --- Polling ---
 
     async def _async_update_data(self):
+        # Proactively replace the UPnP subscription once we pass a fraction of
+        # the granted lifetime (see _record_subscription). Time-based so it
+        # stays correct regardless of scan_interval or how long each poll takes.
+        if self._upnp_sub_time is not None and (
+            time.monotonic() - self._upnp_sub_time >= self._upnp_resubscribe_after
+        ):
+            await self._resubscribe_upnp_events()
+
         combined_data = {
             **await self.requestInfo(),
-            **await self.getEQ(),
-            **await self.getEQPresets(),
+            **await self.getPlayerStatus(),
+            **await self._getEQData(),
             **await self.getNightMode(),
-            **await self.getRearSpeaker(),
-            **await self.getSmartMode(),
             **await self.getPureVoice(),
+            **await self.getSleepTimer(),
+            **await self.getNetworkInfo(),
         }
 
-        # Ensure self.data is initialized to an empty dictionary if it is None
-        if self.data is None:
-            self.data = {}
-        
-        self.data.update(combined_data)
+        # Per-track position offset.
+        # The device's curpos counts up cumulatively within a continuous stream
+        # (e.g. Music Assistant flow mode). When the track changes (DIDL title
+        # or track URI), capture the curpos so we can compute per-track elapsed
+        # time as (curpos - offset). State lives on the coordinator instance,
+        # because DataUpdateCoordinator replaces self.data wholesale.
+        new_title = combined_data.get("media_title")
+        new_uri = combined_data.get("track")
+        new_curpos = combined_data.get("track_position_seconds")
+
+        if new_curpos is not None:
+            # Track change requires BOTH old and new identifiers to be known and
+            # different — a None on either side just means metadata is missing.
+            title_changed = (
+                self._position_last_title is not None
+                and new_title is not None
+                and self._position_last_title != new_title
+            )
+            uri_changed = (
+                self._position_last_uri is not None
+                and new_uri is not None
+                and self._position_last_uri != new_uri
+            )
+            track_changed = title_changed or uri_changed
+
+            if self._position_offset is None or track_changed:
+                self._position_offset = new_curpos
+
+            track_pos = max(0, new_curpos - self._position_offset)
+            duration = combined_data.get("media_track_duration")
+            if duration and track_pos > duration + 5:
+                combined_data["media_position"] = None
+            else:
+                combined_data["media_position"] = track_pos
+                self._position_updated_at = dt_util.utcnow()
+                combined_data["_position_updated_at"] = self._position_updated_at
+
+            # Track the latest known identifiers, but don't overwrite with None
+            if new_title is not None:
+                self._position_last_title = new_title
+            if new_uri is not None:
+                self._position_last_uri = new_uri
+
         return combined_data
 
-    async def _getCommand(self, command):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        url = f'https://{self.address}/httpapi.asp?command={command}'
-        
-        headers = {
-            'Accept-Encoding': "gzip",
-        }
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.get(url, headers=headers,  ssl=self.sslcontext) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            response_json = json.loads(response_text)
-                            _LOGGER.debug(f"%s Response text: %s", command, response_text)
-                            return response_json
-                        else:
-                            _LOGGER.error(f"Failed to get %s: %s", command, response.status)
-                            return {}
-            except Exception as e:
-                _LOGGER.error(f"Error getting %s: %s", command, str(e))
-                return {}
+    # --- Device info fetchers ---
 
     async def getDeviceInfo(self):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        url = f'https://{self.address}/httpapi.asp?command=getDeviceInfo'
-        headers = {
-        'Accept-Encoding': "gzip",
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.get(url, headers=headers,  ssl=self.sslcontext) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            response_json = json.loads(response_text)
-                            #_LOGGER.debug("Device Info Response text: %s", response_text)
-                            #get data out of JSON
-                            device_info = response_json["device_info"]
-                            return device_info
-                        else:
-                            _LOGGER.error("Failed to get device info: %s", response.status)
-                            return {}
-
-            except Exception as e:
-                _LOGGER.error("Error getting device info: %s", str(e))
-                return {}
+        """Fetch device info from the HTTPS API."""
+        response_json = await self._https_get("getDeviceInfo")
+        return response_json.get("device_info", response_json)
 
     async def getDeviceType(self):
-        """Fetch data from the API."""
-        url = f"http://{self.address}:59152/upnp/control/rendercontrol1"
-        
-        payload = """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+        """Fetch device type via UPnP SOAP."""
+        payload_xml = """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
         <s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
         <s:Body>
         <u:GetControlDeviceInfo xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">
         <InstanceID>0</InstanceID></u:GetControlDeviceInfo>
         </s:Body></s:Envelope>"""
-        
-        headers = {
-        'Content-type': "text/xml;charset=\"utf-8\"",
-        'Soapaction': "\"urn:schemas-upnp-org:service:RenderingControl:1#GetControlDeviceInfo\""
-        }
 
-        try:        
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, data=payload, headers=headers) as response:
-                    if response.status == 200:
-                        response_text = await response.text()
-                        
-                        # Parse XML response
-                        namespace = {
-                            's': 'http://schemas.xmlsoap.org/soap/envelope/', 
-                            'u': 'urn:schemas-upnp-org:service:RenderingControl:1'
-                        }
-                        from xml.etree import ElementTree as ET
-                        root = ET.fromstring(response_text)
-                        
-                        # Find the Status element
-                        status_element = root.find('.//u:GetControlDeviceInfoResponse/Status', namespace)
-                        
-                        if status_element is not None:
-                            # Get the text content of the Status element (which is a JSON string)
-                            status_json_str = status_element.text
-                            
-                            # Parse the JSON string into a Python dictionary
-                            status_data = json.loads(status_json_str)
-                            
-                            # Output the status data
-                            return status_data
-                        else:
-                            _LOGGER.error("Failed to fetch data: %s", response.status)
-                            return {}
-        except Exception as e:
-            _LOGGER.error("Error fetching data: %s", str(e))
-            raise ConfigEntryNotReady(f"Timeout while connecting to {self.address}") from e
-            
-    async def requestInfo(self):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        """Fetch data from the API."""
-        url = f'http://{self.address}:59152/upnp/control/rendertransport1'
-        headers = {
-            "Content-type": 'text/xml;charset="utf-8"',
-            "Soapaction": '"urn:schemas-upnp-org:service:AVTransport:1#GetInfoEx"'
+        response_text = await self._soap_request(
+            59152, "/upnp/control/rendercontrol1",
+            "GetControlDeviceInfo", "urn:schemas-upnp-org:service:RenderingControl:1",
+            payload_xml,
+        )
+        if response_text is None:
+            raise ConfigEntryNotReady(f"Cannot connect to {self.address}")
+
+        namespace = {
+            's': 'http://schemas.xmlsoap.org/soap/envelope/',
+            'u': 'urn:schemas-upnp-org:service:RenderingControl:1',
         }
-        payload = """
-        <?xml version="1.0" encoding="utf-8" standalone="yes"?>
+        root = ET.fromstring(response_text)
+        status_element = root.find('.//u:GetControlDeviceInfoResponse/Status', namespace)
+        if status_element is not None:
+            return json.loads(status_element.text)
+        return {}
+
+    async def requestInfo(self):
+        """Fetch transport info via UPnP SOAP."""
+        payload_xml = """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
         <s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
           <s:Body>
             <u:GetInfoEx xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
               <InstanceID>0</InstanceID>
             </u:GetInfoEx>
           </s:Body>
-        </s:Envelope>
-        """
+        </s:Envelope>"""
+
+        response_text = await self._soap_request(
+            59152, "/upnp/control/rendertransport1",
+            "GetInfoEx", "urn:schemas-upnp-org:service:AVTransport:1",
+            payload_xml,
+        )
+        if response_text is None:
+            return {}
+
+        namespaces = {
+            's': 'http://schemas.xmlsoap.org/soap/envelope/',
+            'u': 'urn:schemas-upnp-org:service:AVTransport:1',
+        }
+        try:
+            root = ET.fromstring(response_text)
+            prefix = './/u:GetInfoExResponse/'
+            data = {
+                "play_medium": root.find(f'{prefix}PlayMedium', namespaces).text,
+                "volume_level": root.find(f'{prefix}CurrentVolume', namespaces).text,
+                "track": root.find(f'{prefix}TrackURI', namespaces).text,
+                "transport_state": root.find(f'{prefix}CurrentTransportState', namespaces).text,
+                "transport_status": root.find(f'{prefix}CurrentTransportStatus', namespaces).text,
+                "track_duration": root.find(f'{prefix}TrackDuration', namespaces).text,
+                "mute": root.find(f'{prefix}CurrentMute', namespaces).text,
+                "channel": root.find(f'{prefix}CurrentChannel', namespaces).text,
+                "slaves": root.find(f'{prefix}SlaveFlag', namespaces).text,
+            }
+            # Track position (RelTime field)
+            rel_time = root.find(f'{prefix}RelTime', namespaces)
+            if rel_time is not None and rel_time.text and rel_time.text != "NOT_IMPLEMENTED":
+                data["track_position"] = rel_time.text
+            # Parse DIDL-Lite metadata for title, artist, album, album art
+            metadata_elem = root.find(f'{prefix}TrackMetaData', namespaces)
+            if metadata_elem is not None and metadata_elem.text:
+                data.update(self._parse_didl_metadata(metadata_elem.text))
+            return data
+        except AttributeError:
+            _LOGGER.error("Could not find necessary data in the response")
+            return {}
+
+    def _parse_didl_metadata(self, didl_xml: str) -> dict:
+        """Parse DIDL-Lite XML metadata using regex (avoids namespace issues)."""
+        import html
+        import re
+
+        result = {
+            "media_title": None,
+            "media_artist": None,
+            "media_album": None,
+            "media_image_url": None,
+            "media_track_duration": None,
+        }
+
+        if not didl_xml:
+            return result
+
+        def extract(tag):
+            """Extract text content of <tag>...</tag>, namespace-agnostic."""
+            match = re.search(
+                rf'<(?:[a-zA-Z]+:)?{tag}\b[^>]*>([^<]*)</(?:[a-zA-Z]+:)?{tag}>',
+                didl_xml,
+            )
+            return html.unescape(match.group(1)).strip() if match else None
+
+        def clean(value):
+            if not value or value.lower() in ("un_known", "unknown"):
+                return None
+            return value
+
+        title = clean(extract("title"))
+        if title:
+            result["media_title"] = title
+
+        # Prefer upnp:artist over dc:creator if both exist
+        artist = clean(extract("artist")) or clean(extract("creator"))
+        if artist:
+            result["media_artist"] = artist
+
+        album = clean(extract("album"))
+        if album:
+            result["media_album"] = album
+
+        art = extract("albumArtURI")
+        # Soundbar returns "un_known" as a placeholder in idle/unknown state
+        if art and art.lower() not in ("un_known", "unknown", ""):
+            result["media_image_url"] = art
+
+        # Duration is an attribute on <res duration="...">
+        res_match = re.search(r'<res\b[^>]*\bduration="([^"]+)"', didl_xml)
+        if res_match:
+            duration = res_match.group(1)
+            if duration and duration != "00:00:00":
+                parts = duration.split(":")
+                if len(parts) == 3:
+                    try:
+                        result["media_track_duration"] = (
+                            int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+                        )
+                    except ValueError:
+                        pass
+        return result
+
+    async def setPlayerCmd(self, action: str):
+        """Send a Linkplay player command (play, pause, stop, next, prev, resume, onepause)."""
+        url = f"https://{self.address}/httpapi.asp?command=setPlayerCmd:{action}"
         async with aiohttp.ClientSession() as session:
             try:
                 async with asyncio.timeout(10):
-                    async with session.post(url, headers=headers, data=payload) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            _LOGGER.debug("Response text: %s", response_text)
-                            # Parse the XML response manually, as it's not JSON
-                            from xml.etree import ElementTree as ET
-                            root = ET.fromstring(response_text)
-                            namespaces = {
-                                's': 'http://schemas.xmlsoap.org/soap/envelope/',
-                                'u': 'urn:schemas-upnp-org:service:AVTransport:1'
-                            }
-                            try:
-                                play_medium = root.find('.//u:GetInfoExResponse/PlayMedium', namespaces).text
-                                volume_level = root.find('.//u:GetInfoExResponse/CurrentVolume', namespaces).text
-                                track = root.find('.//u:GetInfoExResponse/TrackURI', namespaces).text
-                                transport_state = root.find('.//u:GetInfoExResponse/CurrentTransportState', namespaces).text
-                                transport_status = root.find('.//u:GetInfoExResponse/CurrentTransportStatus', namespaces).text
-                                track_duration = root.find('.//u:GetInfoExResponse/TrackDuration', namespaces).text
-                                mute = root.find('.//u:GetInfoExResponse/CurrentMute', namespaces).text
-                                channel = root.find('.//u:GetInfoExResponse/CurrentChannel', namespaces).text
-                                slaves = root.find('.//u:GetInfoExResponse/SlaveFlag', namespaces).text
-                                gatheredData = {
-                                    "play_medium": play_medium,
-                                    "volume_level": volume_level,
-                                    "track": track,
-                                    "transport_state": transport_state,
-                                    "transport_status": transport_status,
-                                    "track_duration": track_duration,
-                                    "mute": mute,
-                                    "channel": channel,
-                                    "slaves": slaves,
-                                }
-                                return gatheredData
-                            except AttributeError:
-                                _LOGGER.error("Could not find necessary data in the response")
-                                return {}
-                        else:
-                            _LOGGER.error("Failed to fetch data: %s", response.status)
-                            return {}
+                    async with session.get(url, headers=HTTPS_HEADERS, ssl=self.sslcontext) as response:
+                        text = await response.text()
+                        if response.status != 200 or "OK" not in text:
+                            _LOGGER.warning("setPlayerCmd:%s -> %s: %s", action, response.status, text[:80])
             except Exception as e:
-                _LOGGER.error("Error fetching data: %s", str(e))
-                return {}
+                _LOGGER.error("setPlayerCmd:%s error: %s", action, e)
+
+    async def setAVTransportURI(self, uri: str, metadata: str = ""):
+        """Set the URI to play via UPnP SOAP (used by play_media)."""
+        # Escape XML special chars in URI and metadata
+        import html
+        safe_uri = html.escape(uri, quote=True)
+        safe_meta = html.escape(metadata, quote=True) if metadata else ""
+        body = (
+            '<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            '<InstanceID>0</InstanceID>'
+            f'<CurrentURI>{safe_uri}</CurrentURI>'
+            f'<CurrentURIMetaData>{safe_meta}</CurrentURIMetaData>'
+            '</u:SetAVTransportURI>'
+        )
+        payload_xml = f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>{body}</s:Body></s:Envelope>"""
+        await self._soap_request(
+            59152, "/upnp/control/rendertransport1",
+            "SetAVTransportURI", "urn:schemas-upnp-org:service:AVTransport:1",
+            payload_xml,
+        )
 
     async def setVolume(self, value: float):
-        """Fetch data from the API."""
-        url = f'http://{self._entry.data[CONF_ADDRESS]}:59152/upnp/control/rendercontrol1'
-        headers = {
-            "Content-type": 'text/xml;charset="utf-8"',
-            'Soapaction': "\"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume\""
-        }
-        payload = "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?><s:Envelope s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\" xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:SetVolume xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\"><InstanceID>0</InstanceID><Channel>Single</Channel><DesiredVolume>DesiredVolumeNumber</DesiredVolume></u:SetVolume></s:Body></s:Envelope>"
-        payload = payload.replace("DesiredVolumeNumber", str(round(value)) )
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.post(url, headers=headers, data=payload) as response:
-                        if response.status != 200:
-                            _LOGGER.error("Failed to set volume: %s", response.status)
-                            return {}
-            except Exception as e:
-                _LOGGER.error("Error setting volume: %s", str(e))
+        """Set volume via Linkplay HTTPS API."""
+        await self.setPlayerCmd(f"vol:{max(0, min(100, round(value)))}")
+
+    async def setMute(self, mute: bool):
+        """Set mute via Linkplay HTTPS API."""
+        await self.setPlayerCmd(f"mute:{'1' if mute else '0'}")
+
+    async def seek(self, position_seconds: int):
+        """Seek to position (seconds) via Linkplay HTTPS API."""
+        await self.setPlayerCmd(f"seek:{int(position_seconds)}")
+        # The device resets curpos to the seeked-to position, so our per-track
+        # offset must be 0 for the computed track_pos to match what the user wants.
+        self._position_offset = 0
+
+    # --- EQ (single call for both bands and presets) ---
+
+    async def _getEQData(self):
+        """Fetch EQ data: bands from active preset + preset list (single API call for new firmware)."""
+        if self.newFirmware:
+            response_json = await self._https_get("getEQList")
+            if not response_json or "eq_list" not in response_json:
                 return {}
 
-    async def getEQ(self):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        if self.newFirmware: 
-            url = f'https://{self.address}/httpapi.asp?command=getEQList' 
+            eq_list = response_json["eq_list"]
+            active_id = str(response_json.get("active_eq_id", "0"))
+
+            # Build preset map and data
+            preset_map = {}
+            preset_data = {}
+            active_preset = None
+            active_name = None
+            for item in eq_list:
+                eq_id = str(item.get("eq_id", ""))
+                eq_name = item.get("eq_name", f"Preset {eq_id}")
+                preset_map[eq_id] = eq_name
+                preset_data[eq_id] = item
+                if eq_id == active_id:
+                    active_preset = item
+                    active_name = eq_name
+
+            if active_preset is None and eq_list:
+                active_preset = eq_list[0]
+                active_name = active_preset.get("eq_name", "Unknown")
+
+            result = {
+                "eq_preset_map": preset_map,
+                "eq_preset_data": preset_data,
+                "eq_active_preset": active_name,
+                "eq_active_id": active_id,
+            }
+
+            if active_preset:
+                gain = active_preset["eq_payload"]["gain"]
+                result.update({
+                    "125Hz": gain[0],
+                    "250Hz": gain[1],
+                    "500Hz": gain[2],
+                    "1000Hz": gain[3],
+                    "2000Hz": gain[4],
+                    "4000Hz": gain[5],
+                    "8000Hz": gain[6],
+                })
+
+            return result
         else:
-            url = f'https://{self.address}/httpapi.asp?command=getEQ' 
-        headers = {
-        'Accept-Encoding': "gzip",
-        }
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.get(url, headers=headers,  ssl=self.sslcontext) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            response_json = json.loads(response_text)
-                            _LOGGER.debug("EQ Response text: %s", response_text)
-                            #get data out of JSON
-                            if self.newFirmware:
-                                active_id = str(response_json.get("active_eq_id", "0"))
-                                active_preset = None
-                                for item in response_json.get("eq_list", []):
-                                    if str(item.get("eq_id", "")) == active_id:
-                                        active_preset = item
-                                        break
-                                if active_preset is None and response_json.get("eq_list"):
-                                    active_preset = response_json["eq_list"][0]
-                                if active_preset is None:
-                                    return {}
-                                gain = active_preset["eq_payload"]["gain"]
-                                eqList = {
-                                        "125Hz":gain[0],    #Min -9, Max 6, step 0.5
-                                        "250Hz":gain[1],    #Min -6, Max 6, step 0.5
-                                        "500Hz":gain[2],    #Min -6, Max 6, step 0.5
-                                        "1000Hz":gain[3],   #Min -6, Max 6, step 0.5
-                                        "2000Hz":gain[4],   #Min -6, Max 6, step 0.5
-                                        "4000Hz":gain[5],   #Min -6, Max 6, step 0.5
-                                        "8000Hz":gain[6],   #Min -6, Max 6, step 0.5
-                                    }
-                                return eqList
-                            else:
-                                gain = response_json["eq_setting"]["eq_payload"]["gain"]
-                                gatheredData = {
-                                    "EQ_1_Low": gain[0],
-                                    "EQ_2_Mid": gain[1],
-                                    "EQ_3_High": gain[2]
-                                }
-                                return gatheredData
-                        else:
-                            _LOGGER.error("Failed to get EQ: %s", response.status)
-                            return {}
-            except Exception as e:
-                _LOGGER.warning("Error getting EQ: %s", str(e))
+            response_json = await self._https_get("getEQ")
+            if not response_json or "eq_setting" not in response_json:
                 return {}
+            gain = response_json["eq_setting"]["eq_payload"]["gain"]
+            return {
+                "EQ_1_Low": gain[0],
+                "EQ_2_Mid": gain[1],
+                "EQ_3_High": gain[2],
+            }
 
     async def setEQ(self, value: float, frequency):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-        """Fetch data from the API."""
-        url = f'https://{self._entry.data[CONF_ADDRESS]}/httpapi.asp'
-        headers = {
-        'Accept-Encoding': "gzip",
-        }
+        """Set EQ value for a specific frequency band."""
         if self.newFirmware:
             eqList = {
-                        "125Hz":self.data.get("125Hz",0),  #Min -9, Max 6, step 0.5
-                        "250Hz":self.data.get("250Hz",0),  #Min -6, Max 6, step 0.5
-                        "500Hz":self.data.get("500Hz",0),  #Min -6, Max 6, step 0.5
-                        "1000Hz":self.data.get("1000Hz",0), #Min -6, Max 6, step 0.5
-                        "2000Hz":self.data.get("2000Hz",0), #Min -6, Max 6, step 0.5
-                        "4000Hz":self.data.get("4000Hz",0), #Min -6, Max 6, step 0.5
-                        "8000Hz":self.data.get("8000Hz",0), #Min -6, Max 6, step 0.5
-                    }
+                "125Hz": self.data.get("125Hz", 0),
+                "250Hz": self.data.get("250Hz", 0),
+                "500Hz": self.data.get("500Hz", 0),
+                "1000Hz": self.data.get("1000Hz", 0),
+                "2000Hz": self.data.get("2000Hz", 0),
+                "4000Hz": self.data.get("4000Hz", 0),
+                "8000Hz": self.data.get("8000Hz", 0),
+            }
             eqList[frequency] = value
-            payload = "command=setActiveEQ&payload={\"active_eq_id\":\"0\",\"band\":7,\"eq_payload\":{\"fs\":[125.0,250.0,500.0,1000.0,2000.0,4000.0,8000.0],\"gain\":[125Hz,250Hz,500Hz,1000Hz,2000Hz,4000Hz,8000Hz]}}"
-
-            for key in eqList.keys():
-                payload = payload.replace(key,str(eqList.get(key))) 
+            payload_data = json.dumps({
+                "active_eq_id": "0",
+                "band": 7,
+                "eq_payload": {
+                    "fs": [125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0],
+                    "gain": [eqList["125Hz"], eqList["250Hz"], eqList["500Hz"],
+                             eqList["1000Hz"], eqList["2000Hz"], eqList["4000Hz"], eqList["8000Hz"]],
+                },
+            })
+            await self._https_post(f"command=setActiveEQ&payload={payload_data}")
         else:
-            payload = "command=setEQ&payload={\"eq_id\":\"1\",\"eq_name\":\"Custom\",\"eq_payload\":{\"fs\":[150.0,1000.0,6000.0],\"gain\":[BassFrequency,MidFrequency,HighFrequency],\"q\":[0.7070000171661377,0.5,0.7070000171661377],\"type\":[17.0,11.0,16.0]},\"eq_status\":\"on\"}"
-            BassFrequency = str(self.data.get("EQ_1_Low")) if "EQ_1_Low"!= frequency else str(round(value,1))
-            MidFrequency = str(self.data.get("EQ_2_Mid")) if "EQ_2_Mid"!= frequency else str(round(value,1))
-            HighFrequency = str(self.data.get("EQ_3_High")) if "EQ_3_High"!= frequency else str(round(value,1))
-            payload = payload.replace("BassFrequency",BassFrequency).replace("MidFrequency",MidFrequency).replace("HighFrequency",HighFrequency)
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.post(url, headers=headers, data=payload,  ssl=self.sslcontext) as response:
-                        if response.status != 200:
-                            _LOGGER.error("Failed to set EQ: %s", response.status)
-                            return {}
-                        else:
-                            return {}
-            except Exception as e:
-                _LOGGER.error("Error setting EQ: %s", str(e))
-                return {}
-
-    async def getNightMode(self):
-        response = await self._getCommand("getPersonalListeningMode")
-        if "status" in response:
-            return { "NightMode": response["status"] }
-        else:
-            return {}
-            
-    async def setNightMode(self, value: bool):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-        """Fetch data from the API."""
-        url = f'https://{self.address}/httpapi.asp'
-        headers = {
-        'Accept-Encoding': "gzip",
-        }
-        
-        strvalue = 'on' if value else 'off'
-        payload = 'command=setPersonalListeningMode&payload={"status":"'+strvalue+'"}'
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.post(url, headers=headers, data=payload,  ssl=self.sslcontext) as response:
-                        if response.status != 200:
-                            _LOGGER.error("Failed to set Nightmode: %s", response.status)
-                            return {}
-                        else:
-                            return {}
-            except Exception as e:
-                _LOGGER.error("Error setting Nightmode: %s", str(e))
-                return {}
-
-    async def getRearSpeaker(self):
-        response = await self._getCommand("getRearSpeakerStatus")
-        if "rears" in response:
-            return { "Rears": response["rears"] }
-        else:
-            return {}
-    
-    async def getSmartMode(self):
-        response = await self._getCommand("getSmartMode")
-        if "status" in response:
-            return { "SmartMode": response["status"] }
-        else:
-            return {}
-
-    async def getPureVoice(self):
-        response = await self._getCommand("getPureVoiceState")
-        if "purevoice_state" in response:
-            return { "PureVoice": "on" if response["purevoice_state"] == "1" else "off" }
-        else:
-            return {}
-            
-    async def setPureVoice(self, value: bool):
-        # Disable SSL warnings
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-        """Fetch data from the API."""
-        url = f'https://{self.address}/httpapi.asp'
-        headers = {
-        'Accept-Encoding': "gzip",
-        }
-        
-        strvalue = '1' if value else '0'
-        payload = 'command=setPureVoiceState&payload={"purevoice_state":"'+strvalue+'"}'
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.post(url, headers=headers, data=payload,  ssl=self.sslcontext) as response:
-                        if response.status != 200:
-                            _LOGGER.error("Failed to set PureVoice: %s", response.status)
-                            return {}
-                        else:
-                            return {}
-            except Exception as e:
-                _LOGGER.error("Error setting PureVoice: %s", str(e))
-                return {}
-
-    async def getEQPresets(self):
-        """Fetch the list of EQ presets and the currently active one."""
-        if not self.newFirmware:
-            return {}
-
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        url = f'https://{self.address}/httpapi.asp?command=getEQList'
-        headers = {'Accept-Encoding': "gzip"}
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.get(url, headers=headers, ssl=self.sslcontext) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            response_json = json.loads(response_text)
-                            _LOGGER.debug("EQ Presets Response: %s", response_text)
-
-                            eq_list = response_json.get("eq_list", [])
-                            active_id = str(response_json.get("active_eq_id", "0"))
-
-                            preset_map = {}
-                            preset_data = {}
-                            active_name = None
-                            for item in eq_list:
-                                eq_id = str(item.get("eq_id", ""))
-                                eq_name = item.get("eq_name", f"Preset {eq_id}")
-                                preset_map[eq_id] = eq_name
-                                preset_data[eq_id] = item
-                                if eq_id == active_id:
-                                    active_name = eq_name
-
-                            if not active_name and preset_map:
-                                active_name = next(iter(preset_map.values()))
-
-                            return {
-                                "eq_preset_map": preset_map,
-                                "eq_preset_data": preset_data,
-                                "eq_active_preset": active_name,
-                                "eq_active_id": active_id,
-                            }
-                        else:
-                            _LOGGER.error("Failed to get EQ presets: %s", response.status)
-                            return {}
-            except Exception as e:
-                _LOGGER.warning("Error getting EQ presets: %s", str(e))
-                return {}
+            bass = str(round(value, 1)) if frequency == "EQ_1_Low" else str(self.data.get("EQ_1_Low"))
+            mid = str(round(value, 1)) if frequency == "EQ_2_Mid" else str(self.data.get("EQ_2_Mid"))
+            high = str(round(value, 1)) if frequency == "EQ_3_High" else str(self.data.get("EQ_3_High"))
+            payload_data = json.dumps({
+                "eq_id": "1",
+                "eq_name": "Custom",
+                "eq_payload": {
+                    "fs": [150.0, 1000.0, 6000.0],
+                    "gain": [float(bass), float(mid), float(high)],
+                    "q": [0.7070000171661377, 0.5, 0.7070000171661377],
+                    "type": [17.0, 11.0, 16.0],
+                },
+                "eq_status": "on",
+            })
+            await self._https_post(f"command=setEQ&payload={payload_data}")
 
     async def setActiveEQPreset(self, eq_id: str):
-        """Set the active EQ preset by its ID, sending full payload."""
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
+        """Set the active EQ preset by its ID."""
         preset_data = self.data.get("eq_preset_data", {})
         preset = preset_data.get(eq_id)
         if not preset:
             _LOGGER.error("EQ preset data not found for id: %s", eq_id)
             return
 
-        send_payload = json.dumps({
+        payload_data = json.dumps({
             "active_eq_id": eq_id,
             "band": preset.get("band", 7),
             "eq_payload": preset.get("eq_payload", {}),
         })
+        _LOGGER.debug("Setting EQ preset: %s", payload_data)
+        await self._https_post(f"command=setActiveEQ&payload={payload_data}")
 
-        url = f'https://{self.address}/httpapi.asp'
-        headers = {'Accept-Encoding': "gzip"}
-        payload = f'command=setActiveEQ&payload={send_payload}'
-        _LOGGER.debug("Setting EQ preset: %s", payload)
+    # --- Player position ---
 
-        async with aiohttp.ClientSession() as session:
+    async def getPlayerStatus(self):
+        """Get current playback position from HTTPS API (curpos in milliseconds)."""
+        response = await self._https_get("getPlayerStatus")
+        if not response:
+            return {}
+        try:
+            curpos = response.get("curpos")
+            if curpos is not None:
+                return {"track_position_seconds": int(curpos) // 1000}
+        except (ValueError, TypeError):
+            pass
+        return {}
+
+    # --- Mode getters/setters ---
+
+    async def getNightMode(self):
+        response = await self._https_get("getPersonalListeningMode")
+        if "status" in response:
+            return {"NightMode": response["status"]}
+        return {}
+
+    async def setNightMode(self, value: bool):
+        strvalue = "on" if value else "off"
+        await self._https_post(f'command=setPersonalListeningMode&payload={{"status":"{strvalue}"}}')
+
+    async def getPureVoice(self):
+        response = await self._https_get("getPureVoiceState")
+        if "purevoice_state" in response:
+            return {"PureVoice": "on" if response["purevoice_state"] == "1" else "off"}
+        return {}
+
+    async def setPureVoice(self, value: bool):
+        strvalue = "1" if value else "0"
+        await self._https_post(f'command=setPureVoiceState&payload={{"purevoice_state":"{strvalue}"}}')
+
+    # --- Sleep Timer ---
+
+    async def getSleepTimer(self):
+        # API reports values in seconds; convert to minutes for the UI.
+        response = await self._https_get("getSleepTimer")
+        if "sleep_timer" in response:
             try:
-                async with asyncio.timeout(10):
-                    async with session.post(url, headers=headers, data=payload, ssl=self.sslcontext) as response:
-                        if response.status != 200:
-                            _LOGGER.error("Failed to set EQ preset: %s", response.status)
-                        else:
-                            _LOGGER.debug("EQ preset set successfully to id: %s", eq_id)
-            except Exception as e:
-                _LOGGER.error("Error setting EQ preset: %s", str(e))
+                seconds_set = int(response.get("sleep_timer", 0))
+                seconds_left = int(response.get("remain_time", 0))
+            except (TypeError, ValueError):
+                return {}
+            return {
+                "sleep_timer": seconds_set // 60,
+                "sleep_remain": seconds_left,  # keep remaining in seconds for accuracy
+            }
+        return {}
+
+    async def setSleepTimer(self, minutes: int):
+        # API expects seconds.
+        seconds = max(0, int(minutes) * 60)
+        await self._https_post(f'command=setSleepTimer&payload={{"sleep_timer":"{seconds}"}}')
+
+    # --- Network / Group info ---
+
+    async def getNetworkInfo(self):
+        response = await self._https_get("getStatusEx")
+        if not response:
+            return {}
+        result = {}
+        if "RSSI" in response:
+            result["wifi_rssi"] = int(response["RSSI"])
+        if "internet" in response:
+            result["internet"] = response["internet"] == "1" or response["internet"] == 1
+        if "essid" in response:
+            try:
+                result["wifi_ssid"] = bytes.fromhex(response["essid"]).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                result["wifi_ssid"] = response["essid"]
+        if "WifiChannel" in response:
+            result["wifi_channel"] = int(response.get("WifiChannel", 0))
+        # Group mode from getStatusEx or getGroupInfo
+        if "hm_dev_mode" in response:
+            result["group_mode"] = response["hm_dev_mode"]
+        return result
