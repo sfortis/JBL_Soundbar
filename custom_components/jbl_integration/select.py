@@ -65,11 +65,10 @@ class JBLSourceSelect(SelectEntity):
     def current_option(self):
         """Return the currently active source."""
         name = source_display_name(self.coordinator.data.get("play_medium"))
-        if name is None:
-            return None
-        # Display-only sources (Chromecast, Tidal, Deezer) are not selectable
-        # modes; report them as Network so the state stays within the options.
-        return name if name in SOURCE_KEYS else "Network"
+        # Streaming sources (AirPlay, Spotify, DLNA, Chromecast...) are not
+        # selectable inputs; the select shows no value while they play. The
+        # media_player source attribute still displays them.
+        return name if name in SOURCE_KEYS else None
 
     async def async_select_option(self, option: str):
         """Switch the input source."""
@@ -78,8 +77,8 @@ class JBLSourceSelect(SelectEntity):
             _LOGGER.error("Unknown source: %s", option)
             return
         await self.coordinator.switchSource(mode)
-        # Optimistic update: the switchmode value maps back to the same
-        # friendly name through source_display_name (wifi -> Network fallback).
+        # Optimistic update: BLUETOOTH / LINE-IN map back to the same
+        # friendly name through source_display_name.
         self.coordinator.data["play_medium"] = mode.upper()
         self.async_write_ha_state()
         # Delay then refresh to confirm

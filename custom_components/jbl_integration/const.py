@@ -2,17 +2,13 @@
 DOMAIN = "jbl_integration"
 
 # Selectable input sources -> Linkplay switchmode value.
-# First three are physical inputs available on all JBL One soundbars.
-# The streaming modes set the device into a listening state for that protocol.
-# Cast / Chromecast is intentionally omitted: it activates automatically when
-# a sender device starts casting and cannot be entered manually via this API.
+# Only the physical inputs are selectable. Verified on Authentics 200:
+# switchmode wifi/dlna/airplay/spotify all return OK but land in mode 0
+# (network standby, PlayMedium UNKNOWN); streaming sources activate only
+# when a sender starts a stream, so offering them as options is misleading.
 SOURCE_KEYS = {
     "Bluetooth": "bluetooth",
     "AUX": "line-in",
-    "Network": "wifi",
-    "DLNA": "dlna",
-    "AirPlay": "airplay",
-    "Spotify": "spotify",
 }
 
 # play_medium reported by device -> human-readable source name (display only).
