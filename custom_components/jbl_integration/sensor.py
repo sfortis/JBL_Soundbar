@@ -1,22 +1,16 @@
 """Sensor platform for JBL integration."""
-import aiohttp
-import async_timeout
 import logging
-from datetime import timedelta
 from homeassistant.helpers.entity import Entity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.const import PERCENTAGE, SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+from homeassistant.const import SIGNAL_STRENGTH_DECIBELS_MILLIWATT
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
-    SensorEntityDescription,
     SensorStateClass,
 )
 
 from .const import DOMAIN
-from .coordinator import Coordinator
 
 _LOGGER = logging.getLogger(__name__)
 

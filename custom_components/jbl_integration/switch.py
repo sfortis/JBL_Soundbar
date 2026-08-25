@@ -1,10 +1,8 @@
 """Switch platform for JBL integration."""
-import async_timeout
 import logging
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_state_change
+from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
 from .coordinator import Coordinator
@@ -35,7 +33,7 @@ class JBLPowerSwitch(SwitchEntity):
         self._entry = entry
         self._is_on = False
         self.coordinator = coordinator        
-        self.entity_id = f"switch.{self.coordinator.device_info.get("name", "jbl_integration").replace(' ', '_').lower()}_power"
+        self.entity_id = f"switch.{self.coordinator.device_info.get('name', 'jbl_integration').replace(' ', '_').lower()}_power"
 
     @property
     def name(self):
@@ -108,7 +106,7 @@ class NightModeSwitch(SwitchEntity):
         self._entry = entry
         self._is_on = False
         self.coordinator = coordinator        
-        self.entity_id = f"switch.{self.coordinator.device_info.get("name", "jbl_integration").replace(' ', '_').lower()}_NightMode"
+        self.entity_id = f"switch.{self.coordinator.device_info.get('name', 'jbl_integration').replace(' ', '_').lower()}_NightMode"
 
     @property
     def name(self):

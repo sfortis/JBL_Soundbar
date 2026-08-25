@@ -1,5 +1,4 @@
 """Initialize the JBL integration."""
-import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -8,7 +7,7 @@ from homeassistant.core import HomeAssistant
 from .const import DOMAIN
 from .coordinator import Coordinator
 from homeassistant.helpers import config_validation as cv
-from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_UUID, CONF_ADDRESS, CONF_SCAN_INTERVAL
+from homeassistant.const import CONF_ADDRESS, CONF_SCAN_INTERVAL
 
 # Define the configuration schema for your integration
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)

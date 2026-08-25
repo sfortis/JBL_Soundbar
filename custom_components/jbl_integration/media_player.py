@@ -1,22 +1,18 @@
 """Media player platform for JBL integration."""
 import asyncio
 import logging
-from datetime import datetime, timezone
 
 from homeassistant.components import media_source
 from homeassistant.components.media_player import (
-    BrowseMedia,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
-    MediaType,
     async_process_play_media_url,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import DOMAIN, SOURCE_KEYS, source_display_name
 from .coordinator import Coordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,35 +50,6 @@ class JBLMediaPlayer(MediaPlayerEntity):
         | MediaPlayerEntityFeature.NEXT_TRACK
         | MediaPlayerEntityFeature.PREVIOUS_TRACK
     )
-
-    # Selectable input sources -> Linkplay switchmode value.
-    # First three are physical inputs available on all JBL One soundbars.
-    # The streaming modes set the device into a listening state for that protocol.
-    # Selectable input sources -> Linkplay switchmode value.
-    # Cast / Chromecast is intentionally omitted: it activates automatically when
-    # a sender device starts casting and cannot be entered manually via this API.
-    _SOURCE_KEYS = {
-        "Bluetooth": "bluetooth",
-        "AUX": "line-in",
-        "Network": "wifi",
-        "DLNA": "dlna",
-        "AirPlay": "airplay",
-        "Spotify": "spotify",
-    }
-    # play_medium reported by device -> human-readable source name (display only).
-    # Order matters: more specific keys first since matching is substring-based.
-    _SOURCE_DISPLAY_MAP = {
-        "BLUETOOTH": "Bluetooth",
-        "LINE-IN": "AUX",
-        "AUXIN": "AUX",
-        "AUX": "AUX",
-        "AIRPLAY": "AirPlay",
-        "SPOTIFY": "Spotify",
-        "CAST": "Chromecast",
-        "DLNA": "DLNA",
-        "TIDAL": "Tidal",
-        "DEEZER": "Deezer",
-    }
 
     def __init__(self, entry: ConfigEntry, coordinator: Coordinator):
         self._entry = entry
@@ -201,22 +168,14 @@ class JBLMediaPlayer(MediaPlayerEntity):
 
     @property
     def source(self):
-        play_medium = (self.coordinator.data.get("play_medium") or "").upper()
-        if not play_medium or play_medium == "UNKNOWN":
-            return None
-        # Map known device sources to friendly names; unknown values fall back to "Network"
-        for key, name in self._SOURCE_DISPLAY_MAP.items():
-            if key in play_medium:
-                return name
-        # Streaming sources (THIRD-DLNA, CAST, AIRPLAY, SPOTIFY etc.) are all "Network"
-        return "Network"
+        return source_display_name(self.coordinator.data.get("play_medium"))
 
     @property
     def source_list(self):
-        return list(self._SOURCE_KEYS.keys())
+        return list(SOURCE_KEYS.keys())
 
     async def async_select_source(self, source: str):
-        mode = self._SOURCE_KEYS.get(source)
+        mode = SOURCE_KEYS.get(source)
         if not mode:
             _LOGGER.error("Unknown source: %s", source)
             return

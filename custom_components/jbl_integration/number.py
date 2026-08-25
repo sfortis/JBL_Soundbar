@@ -1,11 +1,9 @@
 """Number platform for JBL integration."""
 import asyncio
-import async_timeout
 import logging
 from homeassistant.components.number import NumberEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.event import async_track_state_change
 
 from .const import DOMAIN
 from .coordinator import Coordinator
@@ -44,7 +42,7 @@ class JBLVolumeNumber(NumberEntity):
         self._entry = entry
         self._value  = 0
         self.coordinator = coordinator
-        self.entity_id = f"number.{self.coordinator.device_info.get("name", "jbl_integration").replace(' ', '_').lower()}_{self.name.lower()}"
+        self.entity_id = f"number.{self.coordinator.device_info.get('name', 'jbl_integration').replace(' ', '_').lower()}_{self.name.lower()}"
         
 
     @property
@@ -177,7 +175,7 @@ class JBLEqNumber(NumberEntity):
         self._value  = 0        
         self.entityName = eqLevel
         self.coordinator = coordinator
-        self.entity_id = f"number.{self.coordinator.device_info.get("name", "jbl_integration").replace(' ', '_').lower()}_{self.entityName.lower()}"
+        self.entity_id = f"number.{self.coordinator.device_info.get('name', 'jbl_integration').replace(' ', '_').lower()}_{self.entityName.lower()}"
 
     @property
     def name(self):

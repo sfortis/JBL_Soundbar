@@ -1,5 +1,4 @@
 """Button platform for JBL integration."""
-import async_timeout
 import logging
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -38,7 +37,7 @@ class JBLButton(ButtonEntity):
         self.entityName = name
         self.entityicon = icon
         self.actionstring = actionstring
-        self.entity_id = f"button.{self.coordinator.device_info.get("name", "jbl_integration").replace(' ', '_').lower()}_{self.entityName.replace(' ', '_').lower()}"
+        self.entity_id = f"button.{self.coordinator.device_info.get('name', 'jbl_integration').replace(' ', '_').lower()}_{self.entityName.replace(' ', '_').lower()}"
         
 
     @property
